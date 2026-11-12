@@ -10,7 +10,7 @@ affected tests](https://testmon.org/blog/determining-affected-tests/)
 This fork stores many versions of each test's dependencies in a single SQLite database that
 every clone, worktree, branch and agent on the machine can share. Records are reused wherever
 they still match the source, regardless of branch, commit or path. See
-[docs/shared-db.md](docs/shared-db.md) for setup (one ini line plus `testmon-admin init`), behaviour, reports and
+[docs/shared-db.md](docs/shared-db.md) for setup (one line in conftest.py or the pytest config, plus `testmon-admin init`), behaviour, reports and
 maintenance. `--tmnet` is not supported.
 
 ## Quickstart

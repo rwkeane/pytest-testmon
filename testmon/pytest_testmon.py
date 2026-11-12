@@ -41,7 +41,7 @@ from testmon.config import (
     FALLBACK_POLICIES,
     INI_OPTIONS,
     REPORT_ENV,
-    number,
+    build_settings,
     resolve_db_location,
     resolve_fallback,
 )
@@ -49,6 +49,52 @@ from testmon.config import (
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
 logger = get_logger(__name__)
+
+
+class TestmonHookspecs:
+    @pytest.hookspec(firstresult=True)
+    def pytest_testmon_settings(self, config):
+        """Return testmon settings as a dict, e.g. ``{"shared_db": "~/.cache/x.sqlite"}``.
+
+        Implement it in the rootdir's conftest.py (it is called before collection, so a
+        conftest.py further down is too late; testmon stops with an error then). Decorate it
+        with ``@pytest.hookimpl(optionalhook=True)`` so the conftest still loads where testmon
+        isn't installed. Names: see testmon.config.SETTINGS. They take precedence over the
+        ``testmon_<name>`` ini options; command line and environment take precedence over both.
+        """
+
+
+def pytest_addhooks(pluginmanager):
+    pluginmanager.add_hookspecs(TestmonHookspecs)
+
+
+def load_settings(config):
+    """Resolve settings once: conftest hook over ini options. Invalid -> UsageError."""
+    try:
+        hook_values = config.hook.pytest_testmon_settings(config=config)
+        return build_settings(hook_values, config.getini)
+    except ValueError as exc:
+        raise pytest.UsageError(f"testmon: {exc}") from exc
+
+
+class TestmonLateSettingsGuard:
+    """A conftest loaded after configuration that sets testmon settings would be ignored."""
+
+    def __init__(self, pluginmanager):
+        # pytest_plugin_registered is historic: it is replayed for the plugins (and initial
+        # conftests) registered before this guard; those were already taken into account
+        self._before = {id(plugin) for plugin in pluginmanager.get_plugins()}
+
+    @pytest.hookimpl
+    def pytest_plugin_registered(self, plugin, manager):  # pylint: disable=unused-argument
+        if id(plugin) not in self._before and hasattr(
+            plugin, "pytest_testmon_settings"
+        ):
+            where = getattr(plugin, "__file__", repr(plugin))
+            raise pytest.UsageError(
+                f"testmon: pytest_testmon_settings in {where} is loaded too late to take "
+                "effect; move it to the conftest.py in the rootdir"
+            )
 
 
 def pytest_addoption(parser):
@@ -213,16 +259,13 @@ def snapshot_allowed(config):
 
 
 def gc_policy(config):
+    settings = config.testmon_settings
     return {
-        "interval_hours": number(
-            config.getini("testmon_gc_interval_hours"), db.DEFAULT_GC_INTERVAL_HOURS
+        "interval_hours": settings.get(
+            "gc_interval_hours", db.DEFAULT_GC_INTERVAL_HOURS
         ),
-        "retention_days": number(
-            config.getini("testmon_retention_days"), db.DEFAULT_RETENTION_DAYS
-        ),
-        "max_versions": number(
-            config.getini("testmon_max_versions"), db.DEFAULT_MAX_VERSIONS, int
-        ),
+        "retention_days": settings.get("retention_days", db.DEFAULT_RETENTION_DAYS),
+        "max_versions": settings.get("max_versions", db.DEFAULT_MAX_VERSIONS),
     }
 
 
@@ -249,14 +292,17 @@ def init_testmon_data(config: Config):
             )
             return
 
+    settings = config.testmon_settings
     location = resolve_db_location(
         rootdir,
         cli_value=config.getoption("testmon_shared_db"),
-        ini_value=config.getini("testmon_shared_db"),
+        ini_value=settings.get("shared_db"),
+        source=settings.source("shared_db") or "ini",
     )
     config.testmon_db_location = location
-    timeout = number(config.getini("testmon_db_timeout"), db.DEFAULT_TIMEOUT)
-    use_snapshots = bool(config.getini("testmon_ignore_collect"))
+    timeout = settings.get("db_timeout", db.DEFAULT_TIMEOUT)
+    use_snapshots = settings.get("ignore_collect", True)
+    project = settings.get("project", "")
     start = time.perf_counter()
     if running_as == "worker":
         # no selection from the controller (e.g. testmon inactive there): decide locally
@@ -274,7 +320,7 @@ def init_testmon_data(config: Config):
                     ignore=config.getini("testmon_ignore_dependencies"), rootdir=rootdir
                 ),
                 None,
-                config.getini("testmon_project") or "",
+                project,
             )
         testmon_data.determine_stable(context_files(config), use_snapshots)
         return
@@ -285,7 +331,7 @@ def init_testmon_data(config: Config):
         rootdir=rootdir,
         environment=environment,
         system_packages=system_packages,
-        project=config.getini("testmon_project") or "",
+        project=project,
         db_location=location,
         timeout=timeout,
     )
@@ -352,7 +398,7 @@ def handle_db_failure(config, error: db.DbError):
     try:
         policy = resolve_fallback(
             config.getoption("testmon_db_fallback"),
-            config.getini("testmon_db_fallback"),
+            config.testmon_settings.get("db_fallback"),
         )
     except ValueError as exc:
         raise pytest.UsageError(str(exc)) from exc
@@ -422,6 +468,12 @@ def pytest_configure(config):
     if running_as == "worker" and config.workerinput.get("testmon_disabled"):
         tm_conf = TmConf(tm_conf.message, False, False)
     config.testmon_config: TmConf = tm_conf
+    config.testmon_settings = build_settings()  # defaults until testmon is requested
+    if tm_conf.message is not None:  # testmon was mentioned (even if switched off)
+        config.testmon_settings = load_settings(config)
+        config.pluginmanager.register(
+            TestmonLateSettingsGuard(config.pluginmanager), "TestmonLateSettingsGuard"
+        )
     report_path = config.getoption("testmon_report") or os.environ.get(REPORT_ENV)
     if report_path and running_as != "worker" and tm_conf.message is not None:
         config.pluginmanager.register(

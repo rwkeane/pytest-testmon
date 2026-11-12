@@ -7,7 +7,20 @@ synced, downloaded, committed or managed by hand.
 
 ## Setup (once per project)
 
-Commit this to the project's pytest configuration, for example `pyproject.toml`:
+Configure the location once, in the project. No command-line flag is needed. Either put it in
+the conftest.py at the repository root (it's Python, so the value can be computed):
+
+```python
+# conftest.py (rootdir)
+import pytest
+
+
+@pytest.hookimpl(optionalhook=True)  # keeps the conftest loadable where testmon isn't installed
+def pytest_testmon_settings(config):
+    return {"shared_db": "~/.cache/testmon/equicloud.sqlite"}
+```
+
+or in the pytest configuration, for example `pyproject.toml`:
 
 ```toml
 [tool.pytest.ini_options]
@@ -17,7 +30,7 @@ testmon_shared_db = "~/.cache/testmon/equicloud.sqlite"
 Then create the database once per machine:
 
 ```console
-$ testmon-admin --rootdir . init     # or: testmon-admin --db ~/.cache/testmon/equicloud.sqlite init
+$ testmon-admin --db ~/.cache/testmon/equicloud.sqlite init
 ```
 
 From then on `pytest --testmon` in any clone, worktree or branch uses that file. Nothing has to
@@ -25,8 +38,28 @@ be done per checkout or per branch. The directory is created with mode 0700 and 
 with 0600.
 
 pytest never creates a shared database itself. If the configured file doesn't exist (wrong
-path, a new machine, deleted), `pytest --testmon` stops with an error. A typo can't
-silently start an empty database.
+path, a new machine, deleted), `pytest --testmon` stops with an error that shows the
+`testmon-admin ... init` command. A typo can't silently start an empty database.
+
+### Settings
+
+| conftest key | ini option | default |
+|---|---|---|
+| `shared_db` | `testmon_shared_db` | (private `.testmondata`) |
+| `db_fallback` | `testmon_db_fallback` | `error` (or `run-all`) |
+| `db_timeout` | `testmon_db_timeout` | 30 (seconds to wait for a lock) |
+| `project` | `testmon_project` | "" (namespace inside a database shared by projects) |
+| `retention_days` | `testmon_retention_days` | 60 |
+| `max_versions` | `testmon_max_versions` | 32 |
+| `gc_interval_hours` | `testmon_gc_interval_hours` | 6 |
+| `ignore_collect` | `testmon_ignore_collect` | true |
+
+The conftest value wins over the ini option. An unknown key or a wrong type stops pytest
+with a usage error. The hook is read before collection, so it must live in the rootdir's
+conftest.py (or in a directory given to pytest on the command line). If a conftest that loads
+later implements it, testmon stops with an error instead of ignoring it. `testmon-admin`
+doesn't import conftests, so give it the path with `--db` (its `--rootdir` lookup only reads
+the pytest ini). `testmon-verify` runs pytest, so it sees the conftest normally.
 
 Where the database is looked up (first match wins):
 
@@ -34,6 +67,7 @@ Where the database is looked up (first match wins):
 |---|---|
 | `--testmon-shared-db=PATH` | shared |
 | `TESTMON_SHARED_DB=PATH` | shared |
+| `shared_db` from `pytest_testmon_settings` (conftest) | shared |
 | `testmon_shared_db = PATH` (ini) | shared |
 | `TESTMON_DATAFILE=PATH` | private (as upstream) |
 | `<rootdir>/.testmondata` | private (as upstream) |
@@ -118,9 +152,6 @@ pytest never deletes, renames or modifies a shared database it refuses to use. A
 imported from another checkout, typically through an editable install made from a different
 clone. Dependency information would then be recorded for the wrong code.
 
-Settings: `testmon_db_timeout` (seconds to wait for a lock, default 30), `testmon_project`
-(namespace inside a database shared by several projects; usually one database per project is
-simpler).
 
 ## Explaining decisions
 
