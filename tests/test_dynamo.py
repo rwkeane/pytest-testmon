@@ -158,7 +158,7 @@ class Project:
         assert old in text, (name, old)
         target.write_text(text.replace(old, new))
 
-    def run(self, *args, expect=0):
+    def run(self, *args, expect=0, testmon=True):
         report = self.path / "report.json"
         if report.exists():
             report.unlink()
@@ -178,8 +178,7 @@ class Project:
                 "-p",
                 "no:cacheprovider",
                 "-q",
-                "--testmon",
-                f"--testmon-report={report}",
+                *(("--testmon", f"--testmon-report={report}") if testmon else ()),
                 *args,
             ],
             cwd=self.path,
@@ -298,14 +297,18 @@ def test_unsupported_torch_is_an_error(project):
             "conftest.py": textwrap.dedent(CONFTEST)
             + textwrap.dedent(
                 """
+                import collections
+
                 import torch._guards
 
                 _original = torch._guards.TracingContext.__init__
 
 
                 def _without_traced_code(self, *args, **kwargs):
+                    # a future torch keeping traced code some other way (still appendable,
+                    # so dynamo itself keeps working)
                     _original(self, *args, **kwargs)
-                    del self.traced_code
+                    self.traced_code = collections.deque(self.traced_code)
 
 
                 torch._guards.TracingContext.__init__ = _without_traced_code
@@ -345,3 +348,95 @@ def test_many_tests_across_xdist_workers(project):
     ran, output = project.run("-n", "4")
     assert ran == outer_tests, output
     assert project.run("-n", "4")[0] == set()
+
+
+COUNTING_CONFTEST = """
+    import json
+
+
+    def pytest_sessionfinish(session):
+        from torch._dynamo.utils import counters
+
+        with open("graphs.json", "w") as file:
+            json.dump(counters["stats"]["unique_graphs"], file)
+    """
+
+COUNTING_TESTS = """
+    import torch
+
+    import model
+
+    outer = torch.compile(model.outer, backend="eager")
+
+
+    def test_first():
+        assert outer(torch.ones(3)).item() == 18.0
+
+
+    def test_second():
+        assert outer(torch.ones(3)).item() == 18.0
+    """
+
+
+def test_compilation_is_untouched(project):
+    """No cache is reset between tests: two tests, one compilation, as without testmon."""
+    project.write(
+        {"conftest.py": COUNTING_CONFTEST, "test_compiled.py": COUNTING_TESTS}
+    )
+
+    def graphs():
+        return json.loads((project.path / "graphs.json").read_text())
+
+    _, output = project.run(testmon=False)
+    assert "2 passed" in output, output
+    assert graphs() == 1
+    ran, output = project.run()
+    assert ran == {"test_first", "test_second"}, output
+    assert graphs() == 1, "testmon made dynamo compile again"
+    # the test that only hit the cache still recorded what it ran
+    project.replace("helpers.py", "return y + 3", "return y + 2 + 1")
+    ran, output = project.run()
+    assert ran == {"test_first", "test_second"}, output
+    assert graphs() == 1
+
+
+def test_graphs_compiled_during_collection(project):
+    project.write(
+        {
+            "conftest.py": "",
+            "test_compiled.py": """
+                import torch
+
+                import model
+
+                outer = torch.compile(model.outer, backend="eager")
+                outer(torch.ones(3))  # compiled while the module is collected
+
+
+                def test_uses_it():
+                    assert outer(torch.ones(3)).item() == 18.0
+                """,
+        }
+    )
+    ran, output = project.run()
+    assert ran == {"test_uses_it"}, output
+    project.replace("model.py", "return x * 2 + 1", "return x * 2 + 1 + 0")
+    ran, output = project.run()
+    assert ran == {"test_uses_it"}, output
+
+
+def test_graphs_testmon_did_not_see_are_an_error(project):
+    project.write(
+        {
+            "conftest.py": "",
+            "test_compiled.py": """
+                from torch._dynamo.utils import counters
+
+
+                def test_pretends_a_graph_was_compiled_elsewhere():
+                    counters["stats"]["unique_graphs"] += 1
+                """,
+        }
+    )
+    _, output = project.run(expect=3)
+    assert "cannot record what torch.compile traced" in output

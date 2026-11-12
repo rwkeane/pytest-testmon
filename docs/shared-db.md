@@ -114,23 +114,27 @@ the same tests even while other agents write.
 Testmon learns a test's dependencies by watching which lines run (coverage). Code compiled
 by `torch.compile` never runs line by line: dynamo reads the function and then runs the
 compiled result, so coverage alone would not see the function's body at all, and an edit
-inside it would not rerun its tests. This fork closes that gap. While recording, it collects
-every function dynamo traced for each test (the compiled function, everything inlined into
-it, including other modules, and the code after graph breaks) and records them as
-dependencies, the same as lines that ran normally. An edit inside a compiled function then
-reruns exactly the tests whose compilations used it.
+inside it would not rerun its tests. This fork closes that gap.
 
-Two consequences:
+For every compiled graph, dynamo records what it traced: the compiled function, everything
+inlined into it (other modules included), and the code after a graph break. The compiled code
+calls its graph on every execution, the first one and every later cache hit. Testmon wraps
+that call while recording, so each test is credited with the traced code of every graph it
+ran, including graphs compiled earlier by another test. An edit inside a compiled function
+then reruns exactly the tests that ran it.
 
-* **Dynamo's caches are reset before each test while dependencies are recorded**
-  (`torch._dynamo.reset()`). Otherwise a test that reused a function compiled by an earlier
-  test would compile nothing and record nothing. Every test therefore compiles what it uses,
-  which is what EquiCloud's conftest already does. Selection-only runs
-  (`--testmon-nocollect`) don't reset.
-* **An unsupported torch is an error.** If `torch._guards.TracingContext` doesn't provide
-  `traced_code` (a future torch might change this internal), pytest stops (exit code 3)
-  with `cannot record what torch.compile traced`, rather than recording incomplete
-  dependencies.
+* **Compilation is untouched.** Nothing is reset between tests: cache hits stay cache hits,
+  with the same number of compilations as without testmon. The only exception is a single
+  `torch._dynamo.reset()` before the first test, and only if graphs were already compiled
+  before testmon could watch, for example during collection. The per-call cost is one
+  extra Python call per graph execution. Selection-only runs (`--testmon-nocollect`) add
+  nothing.
+* **Frames that produce no graph** aren't compiled by dynamo at all. They run as plain
+  Python, which coverage sees.
+* **An unsupported torch is an error.** If a torch release stops working this way
+  (a graph's `traced_code` missing, or more graphs compiled than testmon saw), pytest stops
+  with exit code 3 and `cannot record what torch.compile traced`, and nothing from that
+  batch is stored. Verified on torch 2.10 and 2.14.
 
 Out of scope: TorchScript (`torch.jit.script`), `torch.export`, and generated or native
 kernels (Triton, CUDA, C++).

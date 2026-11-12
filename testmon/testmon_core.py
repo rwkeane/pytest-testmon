@@ -697,6 +697,7 @@ class TestmonCollector:
         # code compiled by torch.compile never executes as Python lines: see testmon/dynamo.py
         self.dynamo = DynamoTracker()
         self._dynamo_lines = {}  # test name -> {filename: lines traced by dynamo}
+        self._dynamo_failed = False
 
     def start_cov(self):
         if not self.cov._started:
@@ -777,14 +778,23 @@ class TestmonCollector:
         self._interrupted_at = self._test_name
 
     def _dynamo_call(self, function):
+        if self._dynamo_failed:
+            return None
         try:
             return function()
         except DynamoUnsupported as exc:
+            # dependencies can't be complete any more: record nothing from now on (the
+            # interrupt handler would otherwise save the batch in progress) and stop
+            self._dynamo_failed = True
             pytest.exit(f"testmon: {exc}", returncode=3)
         return None
 
-    def _harvest_dynamo(self):
-        """Attribute what dynamo traced during the current test (coverage can't see it)."""
+    def harvest_dynamo(self):
+        """Attribute what dynamo traced during the current test (coverage can't see it).
+
+        Called from pytest_runtest_teardown (after fixture teardown), where an unsupported
+        torch can stop the session cleanly; get_batch_coverage_data calls it again (no-op).
+        """
         traced = self._dynamo_call(self.dynamo.harvest)
         if not traced or not self._test_name or self.cov is None:
             return
@@ -794,7 +804,9 @@ class TestmonCollector:
                 files.setdefault(filename, set()).update(lines)
 
     def get_batch_coverage_data(self):
-        self._harvest_dynamo()
+        self.harvest_dynamo()
+        if self._dynamo_failed:
+            return {}  # never store dependencies that may lack compiled code
         if self.check_stack != TestmonCollector.coverage_stack:
             pytest.exit(
                 (

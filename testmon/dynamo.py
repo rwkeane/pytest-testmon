@@ -2,40 +2,48 @@
 
 Coverage only sees lines that Python itself executes. Dynamo compiles a function by reading
 its bytecode and from then on runs the compiled result, so the function's body never shows up
-as executed and testmon would not know the test depends on it. Dynamo does record every code
-object it traced (the compiled function, everything it inlined, the resume functions after a
-graph break) in ``TracingContext.traced_code``; this module collects those for each test.
+as executed and testmon would not know a test depends on it.
 
-Two rules make that complete:
+What dynamo traced for a compiled graph is in its ``TracingContext.traced_code``: the compiled
+function, everything inlined into it and, after a graph break, the resume function. Dynamo
+installs each compiled graph in the frame's globals (``OutputGraph.install_global_unsafe``,
+names ``__compiled_fn...``) and the compiled bytecode calls it on *every* execution, the first
+one and every later cache hit. Wrapping that installed function records, per test, the traced
+code of every graph the test ran, without touching dynamo's caches: compilation behaves
+exactly as without testmon.
 
-* every TracingContext created while a test runs belongs to that test (contexts are recorded
-  from the moment ``torch._guards`` is imported, even mid-test);
-* dynamo's caches are reset before each test, so a test that runs compiled code compiles it,
-  and therefore traces it, itself. Without the reset a cache hit would record nothing.
+Frames that produce no graph are not compiled at all; dynamo runs them as plain Python, which
+coverage sees.
 
-A torch whose TracingContext has no ``traced_code`` cannot be supported: that is an error,
-never a silent gap.
+If a torch release stops installing graphs this way, more graphs get compiled
+(``counters["stats"]["unique_graphs"]``) than were wrapped: that, or a TracingContext without
+``traced_code``, is an error, never a silent gap. Verified on torch 2.10 and 2.14.
 """
 
 import importlib.abc
 import importlib.util
 import sys
 
-GUARDS = "torch._guards"
+OUTPUT_GRAPH = "torch._dynamo.output_graph"
+COMPILED_FN_PREFIX = "__compiled_fn"
 
 
 class DynamoUnsupported(Exception):
     pass
 
 
+def _torch_version():
+    return getattr(sys.modules.get("torch"), "__version__", "?")
+
+
 class _PostImportFinder(importlib.abc.MetaPathFinder):
-    """Calls back right after torch._guards is executed (if it is imported later)."""
+    """Calls back right after torch._dynamo.output_graph is executed (if imported later)."""
 
     def __init__(self, callback):
         self.callback = callback
 
     def find_spec(self, fullname, path, target=None):  # pylint: disable=unused-argument
-        if fullname != GUARDS:
+        if fullname != OUTPUT_GRAPH:
             return None
         sys.meta_path.remove(self)
         try:
@@ -57,17 +65,23 @@ class _PostImportFinder(importlib.abc.MetaPathFinder):
 
 
 class DynamoTracker:
-    """Collects the code torch.compile traced, per test."""
+    """Collects, per test, the code traced for every compiled graph the test executed."""
 
     def __init__(self):
-        self._lists = []  # the traced_code lists of contexts created since begin_test()
-        self._patched = None  # (TracingContext, original __init__)
+        self._ran = {}  # id(traced_code list) -> list, graphs executed since begin_test()
+        self._lines = {}  # id(list) -> (list, {filename: lines}), conversion cache
+        self._patched = None  # (OutputGraph, original install_global_unsafe)
         self._finder = None
+        self._wrapped = 0
+        self._broken = None
+        self._graphs_seen = None  # unique_graphs counter at the last check
+        self._wrapped_seen = 0
+        self._reset_once = False  # graphs were compiled before the hook was installed
 
     # ------------------------------------------------------------------ lifecycle
 
     def start(self):
-        module = sys.modules.get(GUARDS)
+        module = sys.modules.get(OUTPUT_GRAPH)
         if module is not None:
             self._patch(module)
         else:
@@ -80,59 +94,128 @@ class DynamoTracker:
         self._finder = None
         if self._patched is not None:
             cls, original = self._patched
-            cls.__init__ = original
+            cls.install_global_unsafe = original
             self._patched = None
-        self._lists = []
+        self._ran = {}
+        self._lines = {}
 
     def _patch(self, module):
         if self._patched is not None:
             return
-        cls = getattr(module, "TracingContext", None)
-        if cls is None:
+        cls = getattr(module, "OutputGraph", None)
+        original = getattr(cls, "install_global_unsafe", None)
+        if original is None:
             raise DynamoUnsupported(
-                f"torch._guards has no TracingContext (torch "
-                f"{getattr(sys.modules.get('torch'), '__version__', '?')}); testmon cannot "
-                "record what torch.compile traced"
+                f"torch {_torch_version()} has no OutputGraph.install_global_unsafe; "
+                "testmon cannot record what torch.compile traced"
             )
-        original = cls.__init__
-        lists = self
+        tracker = self
 
-        def __init__(self_, *args, **kwargs):
-            original(self_, *args, **kwargs)
-            traced = getattr(self_, "traced_code", None)
-            if not isinstance(traced, list):
-                lists._lists.append(None)  # reported by harvest()
-            else:
-                lists._lists.append(traced)
+        def install_global_unsafe(self_, name, value):
+            if (
+                isinstance(name, str)
+                and name.startswith(COMPILED_FN_PREFIX)
+                and callable(value)
+            ):
+                value = tracker._wrap(self_, value)
+            return original(self_, name, value)
 
-        cls.__init__ = __init__
+        cls.install_global_unsafe = install_global_unsafe
         self._patched = (cls, original)
+        self._graphs_seen = self._unique_graphs()
+        # graphs compiled before now (e.g. during collection) aren't wrapped: a later cache
+        # hit on one would go unrecorded, so empty dynamo's caches once, before the first test
+        self._reset_once = bool(self._graphs_seen)
         if self._finder is not None and self._finder in sys.meta_path:
             sys.meta_path.remove(self._finder)
         self._finder = None
 
+    def _wrap(self, output_graph, compiled_fn):
+        self._wrapped += 1
+        traced = getattr(
+            getattr(output_graph, "tracing_context", None), "traced_code", None
+        )
+        if not isinstance(traced, list):
+            self._broken = (
+                f"torch {_torch_version()}: the TracingContext of a compiled graph has no "
+                "traced_code list; testmon cannot record what torch.compile traced"
+            )
+            return compiled_fn
+        ran = self._ran
+        key = id(traced)
+
+        def compiled_graph(*args, **kwargs):
+            ran[key] = traced  # this graph runs (first call or cache hit) in this test
+            return compiled_fn(*args, **kwargs)
+
+        import torch._dynamo  # pylint: disable=import-outside-toplevel
+
+        # like dynamo's own graph functions: never traced by dynamo itself
+        return torch._dynamo.disable(compiled_graph)
+
+    @staticmethod
+    def _unique_graphs():
+        utils = sys.modules.get("torch._dynamo.utils")
+        counters = getattr(utils, "counters", None)
+        if counters is None:
+            return None
+        return counters["stats"]["unique_graphs"]
+
+    def _check_all_graphs_wrapped(self):
+        graphs = self._unique_graphs()
+        if graphs is None or self._graphs_seen is None:
+            self._graphs_seen = graphs
+            self._wrapped_seen = self._wrapped
+            return
+        # torch._dynamo.reset() clears the counters: count from zero again
+        new_graphs = (
+            graphs - self._graphs_seen if graphs >= self._graphs_seen else graphs
+        )
+        new_wrapped = self._wrapped - self._wrapped_seen
+        self._graphs_seen, self._wrapped_seen = graphs, self._wrapped
+        if new_graphs > new_wrapped:
+            raise DynamoUnsupported(
+                f"torch {_torch_version()} compiled {new_graphs} graph(s) of which testmon "
+                f"saw {new_wrapped} installed; testmon cannot record what torch.compile "
+                "traced with this torch"
+            )
+
     # ------------------------------------------------------------------ per test
 
     def begin_test(self):
-        """Forget earlier contexts and empty dynamo's caches (only if dynamo is loaded)."""
-        self._lists = []
-        dynamo = sys.modules.get("torch._dynamo")
-        if dynamo is not None and hasattr(dynamo, "reset"):
-            dynamo.reset()
+        """Start recording the graphs the next test runs.
+
+        Dynamo's caches are left alone, except once if graphs had been compiled before the
+        hook was installed.
+        """
+        if self._reset_once:
+            self._reset_once = False
+            import torch._dynamo  # pylint: disable=import-outside-toplevel
+
+            torch._dynamo.reset()
+            self._graphs_seen = self._unique_graphs()
+            self._wrapped_seen = self._wrapped
+        self._ran.clear()
 
     def harvest(self):
-        """{filename: lines} traced by dynamo since begin_test(); clears the record."""
-        lists, self._lists = self._lists, []
+        """{filename: lines} traced for the graphs run since begin_test(); clears the record."""
+        if self._broken:
+            raise DynamoUnsupported(self._broken)
+        if self._patched is not None:
+            self._check_all_graphs_wrapped()
+        ran = list(self._ran.values())
+        self._ran.clear()
         traced = {}
-        for codes in lists:
-            if codes is None:
-                raise DynamoUnsupported(
-                    "torch's TracingContext has no traced_code list (torch "
-                    f"{getattr(sys.modules.get('torch'), '__version__', '?')}); testmon "
-                    "cannot record what torch.compile traced"
-                )
-            for code in codes:
-                lines = {line for _, _, line in code.co_lines() if line}
-                if lines:
-                    traced.setdefault(code.co_filename, set()).update(lines)
+        for codes in ran:
+            cached = self._lines.get(id(codes))
+            if cached is None or cached[0] is not codes:
+                files = {}
+                for code in codes:
+                    lines = {line for _, _, line in code.co_lines() if line}
+                    if lines:
+                        files.setdefault(code.co_filename, set()).update(lines)
+                cached = (codes, files)
+                self._lines[id(codes)] = cached
+            for filename, lines in cached[1].items():
+                traced.setdefault(filename, set()).update(lines)
         return traced

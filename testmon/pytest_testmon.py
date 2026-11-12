@@ -634,6 +634,12 @@ class TestmonCollect:
         if result.excinfo and issubclass(result.excinfo[0], BaseException):
             self.testmon.discard_current()
 
+    @pytest.hookimpl(trylast=True)
+    def pytest_runtest_teardown(self, item, nextitem):  # pylint: disable=unused-argument
+        # what torch.compile traced in this test, fixture teardown included; a plain hook,
+        # so that an unsupported torch stops the session with a clear error (pytest.exit)
+        self.testmon.harvest_dynamo()
+
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):  # pylint: disable=unused-argument
         result = yield
