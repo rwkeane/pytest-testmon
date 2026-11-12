@@ -9,12 +9,21 @@ from collections import defaultdict
 from inspect import getframeinfo, currentframe
 
 from testmon.common import git_path, git_current_branch, git_current_head
+from testmon import db
 from testmon.process_code import (
     Module,
+    blob_to_checksums,
     create_fingerprint_source,
     checksums_to_blob,
     methods_to_checksums,
     bytes_to_string_and_fsha,
+)
+from testmon.selection import (
+    ALL_INVALID,
+    MISMATCH,
+    MISSING,
+    VALID_FAILING,
+    InvalidDep,
 )
 from testmon.testmon_core import (
     TestmonData as CoreTestmonData,
@@ -128,23 +137,19 @@ class TestMisc(object):
         con.close()
 
     def test_sqlite_assumption_foreign_key(self, tmdata):
-        def test_execution_count(test_execution_id):
-            return tmdata.db.con.execute(
-                "SELECT count(*) FROM test_execution where id = ?",
-                (test_execution_id,),
-            ).fetchone()[0]
+        """Identical observations dedupe; deleting an observation cascades to its deps."""
+
+        def count(sql, *params):
+            return tmdata.db.con.execute(sql, params).fetchone()[0]
 
         record1 = {
             "filename": "test_a.py",
             "method_checksums": FINGERPRINT0,
-            "mtime": None,
             "fsha": bytes_to_string_and_fsha(b"FINGERPRINT0")[1],
         }
-
         record2 = {
             "filename": "test_a.py",
             "method_checksums": FINGERPRINT1,
-            "mtime": None,
             "fsha": bytes_to_string_and_fsha(b"FINGERPRINT1")[1],
         }
         tmdata.db.insert_test_file_fps(
@@ -152,36 +157,32 @@ class TestMisc(object):
             exec_id=tmdata.exec_id,
         )
         con = tmdata.db.con
-        first_test_execution_id = con.execute(
-            "SELECT id FROM test_execution"
-        ).fetchone()[0]
-        assert first_test_execution_id == 1
+        first_id = con.execute("SELECT id FROM observation").fetchone()[0]
+        assert first_id == 1
 
         tmdata.db.insert_test_file_fps(
             {"test_a.py::n2": {"deps": [record2], "failed": False, "duration": 0}},
             exec_id=tmdata.exec_id,
         )
-        second_test_execution_id = con.execute(
-            "SELECT max(id) FROM test_execution"
-        ).fetchone()[0]
-        assert second_test_execution_id == 2
+        assert count("SELECT max(id) FROM observation") == 2
 
+        # the same observation again: no new row (upstream deleted and re-inserted)
         tmdata.db.insert_test_file_fps(
             {"test_a.py::n1": {"deps": [record1], "failed": False, "duration": 0}},
             exec_id=tmdata.exec_id,
         )
-        third_test_execution_id = con.execute(
-            "SELECT max(id) FROM test_execution"
-        ).fetchone()[0]
-        assert third_test_execution_id == 3
+        assert count("SELECT count(*) FROM observation") == 2
+        assert (
+            count("SELECT count(*) FROM observation_dep WHERE observation_id = ?", 1)
+            == 1
+        )
 
-        assert first_test_execution_id != second_test_execution_id
-        assert test_execution_count(first_test_execution_id) == 0
-        assert test_execution_count(second_test_execution_id) == 1
-        assert test_execution_count(third_test_execution_id) == 1
-        tmdata.db.con.execute("DELETE FROM test_execution_file_fp")
-        tmdata.db.con.execute("DELETE FROM test_execution")
-        assert test_execution_count(second_test_execution_id) == 0
+        con.execute("DELETE FROM observation WHERE id = ?", (first_id,))
+        assert (
+            count("SELECT count(*) FROM observation_dep WHERE observation_id = ?", 1)
+            == 0
+        )
+        assert count("SELECT count(*) FROM observation_dep") == 1
 
     def test_git_utilities(self, testdir, git_repo):
         assert git_path()
@@ -325,115 +326,86 @@ class TestData:
     def test_filenames_fingerprints(self, tmdata):
         tmdata.write_fixture("test_1.py::test_1", {"test_1.py": FINGERPRINT1}, failed=1)
 
-        fps = tuple(tmdata.db.filenames_fingerprints(tmdata.exec_id)[0].values())
-        assert fps == (
-            "test_1.py",
-            None,
-            "100",
-            1,
-            1,
-        )
+        (observation,) = tmdata.db.observations_of("test_1.py::test_1", tmdata.exec_id)
+        assert observation["failed"] == 1
+        assert observation["dep_count"] == 1
+        (dep,) = tmdata.db.observation_deps(observation["id"])
+        assert dep["filename"] == "test_1.py"
+        # the content the fingerprint was recorded against is memoised as matching
+        assert tmdata.db.con.execute(
+            "SELECT fsha, valid FROM fp_match WHERE fp_id = ?", (dep["id"],)
+        ).fetchone()[:] == ("100", 1)
 
     def test_write_get_changed_file_data(self, tmdata):
         tmdata.write_fixture("test_1.py::test_1", {"test_1.py": FINGERPRINT1}, failed=1)
 
-        node_data = tmdata.db.fetch_changed_file_data([1], tmdata.exec_id)
-
-        assert node_data == [
-            ["test_1.py", "test_1.py::test_1", FINGERPRINT1, 1, 1, DEFAULT_DURATION]
+        (observation,) = tmdata.db.observations_of("test_1.py::test_1", tmdata.exec_id)
+        deps = tmdata.db.observation_deps(observation["id"])
+        assert [(d["filename"], blob_to_checksums(d["checksums"])) for d in deps] == [
+            ("test_1.py", FINGERPRINT1)
         ]
+        assert observation["duration"] == DEFAULT_DURATION
 
     def test_determine_stable_flow(self, tmdata):
         tmdata.write_fixture("test_1.py::test_1", {"test_1.py": FINGERPRINT1})
+        tmdata.determine_stable()
+        assert tmdata.unstable_test_names == set()
+        assert tmdata.deselected_tests == {"test_1.py::test_1"}
 
-        tmdata.source_tree.cache["test_1.py"].mtime = 1100.0
-        tmdata.source_tree.cache["test_1.py"].fsha = "100" + "missing"
+        # the file is gone (not cached, not on disk)
         del tmdata.source_tree.cache["test_1.py"]
+        tmdata.determine_stable()
 
-        filenames_fingerprints = tmdata.db.filenames_fingerprints(tmdata.exec_id)
-
-        assert tuple(filenames_fingerprints[0].values()) == (
-            "test_1.py",
-            None,
-            "100",
-            1,
-            0,
-        )
-
-        _, mtime_misses = split_filter(
-            tmdata.source_tree, check_mtime, filenames_fingerprints
-        )
-
-        fsha_hits, fsha_misses = split_filter(
-            tmdata.source_tree, check_fsha, mtime_misses
-        )
-
-        changed_files = [fsha_miss["fingerprint_id"] for fsha_miss in fsha_misses]
-
-        assert changed_files == [1]
-
-        changed_file_data = tmdata.db.fetch_changed_file_data(
-            changed_files, tmdata.exec_id
-        )
-
-        assert changed_file_data == [
-            ["test_1.py", "test_1.py::test_1", FINGERPRINT1, 1, 0, DEFAULT_DURATION]
-        ]
-
-        hits, misses = split_filter(
-            tmdata.source_tree, check_fingerprint, changed_file_data
-        )
-        assert misses == changed_file_data
+        assert tmdata.unstable_test_names == {"test_1.py::test_1"}
+        decision = tmdata.selection.decisions["test_1.py::test_1"]
+        assert not decision.deselect
+        assert decision.reason == ALL_INVALID
+        assert decision.invalid_dep == InvalidDep("test_1.py", MISSING)
 
     def test_new_determine_stable_flow(self, tmdata):
         tmdata.write_fixture("test_1.py::test_1", {"test_1.py": FINGERPRINT1})
-        del tmdata.source_tree.cache["test_1.py"]
 
-        filenames = tmdata.db.filenames(tmdata.exec_id)
+        assert tmdata.db.filenames(tmdata.exec_id) == ["test_1.py"]
 
-        assert filenames == ["test_1.py"]
+        # same content sha: valid straight from the memo, nothing parsed
+        tmdata.determine_stable()
+        assert tmdata.unstable_test_names == set()
+        assert tmdata.selection.new_memo == []
 
-        assert (
-            len(
-                tmdata.db.fetch_unknown_files(
-                    files_fshas={"test_1.py": "100"},
-                    exec_id=tmdata.exec_id,
-                )
-            )
-            == 0
+        # new sha, but the executed block is still there: still valid (content-based)
+        tmdata.source_tree.cache["test_1.py"] = Module(
+            source_code="FINGERPRINT1\n# a new comment", fs_fsha="101"
         )
-        changed_file_data = tmdata.db.fetch_unknown_files(
-            files_fshas={"test_1.py": "101"}, exec_id=tmdata.exec_id
+        tmdata.determine_stable()
+        assert tmdata.unstable_test_names == set()
+        assert [(fsha, valid) for _, fsha, valid in tmdata.selection.new_memo] == [
+            ("101", 1)
+        ]
+
+        # the executed block changed: invalid
+        tmdata.source_tree.cache["test_1.py"] = Module(
+            source_code="FINGERPRINT2", fs_fsha="102"
         )
-
-        assert changed_file_data == ["test_1.py"]
-
-        misses = tmdata.db.determine_tests(
-            tmdata.exec_id, collect_mhashes(tmdata.source_tree, changed_file_data)
-        )["affected"]
-
-        assert misses == ["test_1.py::test_1"]
+        tmdata.determine_stable()
+        assert tmdata.unstable_test_names == {"test_1.py::test_1"}
+        assert tmdata.selection.decisions[
+            "test_1.py::test_1"
+        ].invalid_dep == InvalidDep("test_1.py", MISMATCH)
 
     def test_new_determine_stable_flow_missing_file(self, tmdata):
         tmdata.write_fixture("test_1.py::test_1a", {"test_1.py": FINGERPRINT1})
         tmdata.write_fixture("test_2.py::test_2a", {"test_2.py": FINGERPRINT1})
 
-        filenames = tmdata.db.filenames(tmdata.exec_id)
-
-        assert filenames == ["test_1.py", "test_2.py"]
+        assert tmdata.db.filenames(tmdata.exec_id) == ["test_1.py", "test_2.py"]
 
         del tmdata.source_tree.cache["test_2.py"]
+        tmdata.determine_stable()
 
-        changed_file_data = tmdata.db.fetch_unknown_files(
-            {"test_1.py": "100"}, tmdata.exec_id
-        )
-
-        assert changed_file_data == ["test_2.py"]
-
-        assert tmdata.db.determine_tests(
-            tmdata.exec_id,
-            {"test_1.py": FINGERPRINT1, "test_2.py": None},
-        )["affected"] == ["test_2.py::test_2a"]
+        assert tmdata.unstable_test_names == {"test_2.py::test_2a"}
+        assert tmdata.deselected_tests == {"test_1.py::test_1a"}
+        assert tmdata.selection.decisions[
+            "test_2.py::test_2a"
+        ].invalid_dep == InvalidDep("test_2.py", MISSING)
 
     def test_garbage_retain_stable(self, tmdata):
         tmdata.write_fixture("test_1.py::test_1", {"test_1.py": FINGERPRINT1})
@@ -461,20 +433,17 @@ class TestData:
         for node, files in node_data.items():
             tmdata.write_fixture(node, files)
 
-        result = defaultdict(dict)
+        def newest_deps():
+            result = {}
+            for node in node_data:
+                newest = tmdata.db.observations_of(node, tmdata.exec_id)[0]
+                result[node] = {
+                    d["filename"]: blob_to_checksums(d["checksums"])
+                    for d in tmdata.db.observation_deps(newest["id"])
+                }
+            return result
 
-        compare_to = copy.deepcopy(node_data)
-        for (
-            filename,
-            node_name,
-            fingerprint,
-            _,
-            _,
-            _,
-        ) in tmdata.db.fetch_changed_file_data(list(range(10)), tmdata.exec_id):
-            result[node_name][filename] = fingerprint if fingerprint != [""] else []
-
-        assert result == node_data
+        assert newest_deps() == node_data
 
         change = {
             "test_1.py::test_1": {
@@ -492,17 +461,9 @@ class TestData:
             },
         )
 
-        for (
-            filename,
-            node_name,
-            fingerprint,
-            _,
-            _,
-            _,
-        ) in tmdata.db.fetch_changed_file_data(list(range(10)), tmdata.exec_id):
-            result[node_name][filename] = fingerprint if fingerprint != [""] else []
-
-        assert result == node_data
+        assert newest_deps() == node_data
+        # multi-version: the earlier observation of test_1 is kept
+        assert len(tmdata.db.observations_of("test_1.py::test_1", tmdata.exec_id)) == 2
 
     def test_collect_garbage(self, tmdata):
         tmdata = tmdata
@@ -522,7 +483,7 @@ class TestData:
             td2.determine_stable()
             assert set(td2.all_tests) == set()
 
-    def test_remove_unused_fingerprints(self, tmdata):
+    def test_remove_unused_fingerprints(self, tmdata, monkeypatch):
         tmdata.write_fixture("n1", {"test_a.py": FINGERPRINT1})
 
         tmdata.source_tree.cache["test_a.py"] = None
@@ -530,9 +491,16 @@ class TestData:
 
         tmdata.sync_db_fs_tests(set())
         tmdata.db.finish_execution(tmdata.exec_id)
-
+        # nothing is deleted while it may still be useful on another branch ...
         c = tmdata.db.con
-        assert c.execute("SELECT * FROM file_fp").fetchall() == []
+        assert c.execute("SELECT count(*) FROM dep_fp").fetchone()[0] == 1
+
+        # ... but once unused for longer than the retention period, everything goes
+        real_now = db.now()
+        monkeypatch.setattr(db, "_clock", lambda: real_now + 61 * db.DAY)
+        tmdata.db.gc()
+        for table in ("observation", "observation_dep", "dep_fp", "fp_match"):
+            assert c.execute(f"SELECT * FROM {table}").fetchall() == [], table
 
     def test_one_failed_in_fingerprints(self, tmdata):
         tmdata.write_fixture(
@@ -542,7 +510,10 @@ class TestData:
         tmdata.write_fixture(
             "test_1.py::test_2", {"test_1.py": FINGERPRINT1}, failed=False
         )
-        assert tmdata.db.filenames_fingerprints(tmdata.exec_id)[0]["sum(failed)"] == 1
+        tmdata.determine_stable()
+        assert tmdata.failing_tests == ["test_1.py::test_1"]
+        assert tmdata.selection.decisions["test_1.py::test_1"].reason == VALID_FAILING
+        assert tmdata.deselected_tests == {"test_1.py::test_2"}
 
     def test_nodes_classes_modules_durations(self, tmdata: CoreTestmonDataForTest):
         tmdata.create_report(2, 3, "test_a1", "tests.py", "TestA")

@@ -1,86 +1,513 @@
+"""SQLite storage for testmon: shared between checkouts and processes, multi-version.
+
+One database can serve every checkout, branch and agent on a machine. Each test can have
+many *observations* (the set of fingerprinted code blocks one execution covered, plus its
+outcome); an observation is reused wherever its fingerprints still match the source,
+regardless of the path, branch or commit that produced it. See docs/shared-db.md.
+
+Concurrency rules followed throughout this module:
+
+* connections are never shared between processes; transactions are explicit
+  (``isolation_level=None``), writes always start with ``BEGIN IMMEDIATE`` so a read lock is
+  never upgraded (which would fail with SQLITE_BUSY without consulting the busy handler);
+* a write transaction contains only database work; everything else is prepared before it;
+* row ids are never cached across transactions (garbage collection may delete rows between).
+"""
+
+import hashlib
 import json
 import os
+import random
 import sqlite3
-
+import stat
+import sys
+import time
 from collections import namedtuple
-from functools import lru_cache
+from contextlib import contextmanager
 
-from testmon.common import TestExecutions
-from testmon.process_code import blob_to_checksums, checksums_to_blob
+from testmon.process_code import checksums_to_blob
 
-DATA_VERSION = 15
-
-ChangedFileData = namedtuple(
-    "ChangedFileData", "filename name method_checksums id failed"
+DATA_VERSION = 1000
+SCHEMA_VERSION = (
+    DATA_VERSION  # documentation alias; code reads DATA_VERSION (tests patch it)
 )
+# The oldest schema version a client may support and still use a database at DATA_VERSION.
+COMPAT_VERSION = 1000
+# "TMON"; distinguishes this fork's databases from upstream testmon's (application_id 0).
+APPLICATION_ID = 0x544D4F4E
+# Bump when the block/fingerprint algorithm changes: fp_match memo rows are keyed by it.
+FINGERPRINT_ALGO_VERSION = 1
+
+DEFAULT_TIMEOUT = 30.0
+WRITE_ATTEMPTS = 3
+
+DAY = 24 * 3600.0
+DEFAULT_RETENTION_DAYS = 60
+DEFAULT_MAX_VERSIONS = 32
+DEFAULT_GC_INTERVAL_HOURS = 6
+SUPERSEDED_RETENTION_DAYS = 7
+MEMO_RETENTION_DAYS = 30
+SESSION_RETENTION_DAYS = 30
+SNAPSHOTS_PER_FILE = 8
+GC_CHUNK = 5000
+LAST_USED_GRANULARITY = DAY
+
+# version -> (migrate(connection), compat_version). Applied in order, each in an EXCLUSIVE
+# transaction. compat_version is the oldest client schema that can still use the result:
+# an additive migration keeps the previous value, a breaking one raises it to its version.
+MIGRATIONS = {}
+
+_clock = time.time
 
 
-class TestmonDbException(Exception):
-    pass
+def now():
+    """Wall-clock time; tests replace ``testmon.db._clock`` to drive retention."""
+    return _clock()
 
 
-def connect(datafile, readonly=False):
-    return sqlite3.connect(
-        f"file:{datafile}{'?mode=ro' if readonly else ''}", uri=True, timeout=60
+def parser_key():
+    """Identifies how block checksums were computed (they depend on the ast of the Python)."""
+    return (
+        f"{FINGERPRINT_ALGO_VERSION}:{sys.version_info.major}.{sys.version_info.minor}"
     )
 
 
-def connection_options(connection):
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA synchronous = OFF")
-    connection.execute("PRAGMA foreign_keys = TRUE ")
-    connection.execute("PRAGMA recursive_triggers = TRUE ")
-    connection.row_factory = sqlite3.Row
-    return connection
+class TestmonDbException(Exception):
+    __test__ = False
 
 
-def check_fingerprint_db(
-    files_methods_checksums, file_name, fingerprint: ChangedFileData
-):  # filename name method_checksums id failed
-    if file_name in files_methods_checksums and files_methods_checksums[file_name]:
-        if set(fingerprint) - set(files_methods_checksums[file_name]):
-            return False
-        return True
-    return False
+class DbError(TestmonDbException):
+    """A database problem, classified so callers can apply the fallback policy and report it.
+
+    reason_code is one of: open_failed, permission, corrupt, incompatible_schema, foreign_db,
+    lock_timeout, io, db_error.
+    """
+
+    def __init__(self, reason_code, detail):
+        super().__init__(f"{reason_code}: {detail}")
+        self.reason_code = reason_code
+        self.detail = detail
+
+    @classmethod
+    def from_sqlite(cls, exc):
+        return cls(classify_sqlite_error(exc), str(exc))
 
 
-def check_data_version(connection, datafile, data_version):
-    stored_data_version = connection.execute("PRAGMA user_version").fetchone()[0]
+def classify_sqlite_error(exc):
+    message = str(exc).lower()
+    if "locked" in message or "busy" in message:
+        return "lock_timeout"
+    if (
+        "malformed" in message
+        or "not a database" in message
+        or "disk image" in message
+        or "file is encrypted" in message
+    ):
+        return "corrupt"
+    if "readonly" in message or "read-only" in message or "permission" in message:
+        return "permission"
+    if "unable to open" in message:
+        return "open_failed"
+    if (
+        "disk i/o" in message
+        or "disk is full" in message
+        or "database or disk is full" in message
+    ):
+        return "io"
+    return "db_error"
 
-    if int(stored_data_version) == data_version:
-        return connection, False
 
-    connection.close()
-    os.remove(datafile)
-    connection = connect(datafile)
-    connection = connection_options(connection)
-    return connection, True
+def _is_busy(exc):
+    return classify_sqlite_error(exc) == "lock_timeout"
+
+
+_commits = {"observations": 0}
+
+
+def _fault(point):
+    """Fault injection for tests: TESTMON_FAULT_INJECT=point[:raise|:exit][,point...]."""
+    spec = os.environ.get("TESTMON_FAULT_INJECT")
+    if not spec:
+        return
+    for item in spec.split(","):
+        name, _, action = item.strip().partition(":")
+        if name != point:
+            continue
+        if action == "raise":
+            raise sqlite3.OperationalError(f"injected fault at {point}")
+        sys.stderr.flush()
+        os._exit(17)  # pylint: disable=protected-access
+
+
+# --------------------------------------------------------------------------------------
+# Location security (shared databases only)
+# --------------------------------------------------------------------------------------
+
+
+def secure_location(path):
+    """Create/verify a private location for a shared database (owner-only, POSIX).
+
+    Refuses (DbError "permission") a directory or file owned by another user, or one that is
+    group/world-writable; tightens group/world-readable files that we own.
+    """
+    if os.name != "posix":
+        return
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise DbError("open_failed", f"cannot create {directory}: {exc}") from exc
+    uid = os.getuid()
+    st = os.stat(directory)
+    if st.st_uid != uid:
+        raise DbError(
+            "permission",
+            f"directory {directory} is owned by uid {st.st_uid}, not by this user ({uid})",
+        )
+    if st.st_mode & 0o022:
+        raise DbError(
+            "permission",
+            f"directory {directory} is group- or world-writable "
+            f"(mode {stat.S_IMODE(st.st_mode):o}); use a private directory (chmod 700)",
+        )
+    for candidate in (path, path + "-wal", path + "-shm"):
+        try:
+            st = os.stat(candidate)
+        except FileNotFoundError:
+            continue
+        if st.st_uid != uid:
+            raise DbError(
+                "permission",
+                f"{candidate} is owned by uid {st.st_uid}, not by this user ({uid})",
+            )
+        if st.st_mode & 0o022:
+            raise DbError(
+                "permission",
+                f"{candidate} is group- or world-writable (mode {stat.S_IMODE(st.st_mode):o})",
+            )
+        if st.st_mode & 0o044:
+            os.chmod(candidate, 0o600)
+    if not os.path.exists(path):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise DbError("open_failed", f"cannot create {path}: {exc}") from exc
+
+
+# --------------------------------------------------------------------------------------
+# Schema
+# --------------------------------------------------------------------------------------
+
+SCHEMA_STATEMENTS = (
+    # value is untyped on purpose: counters are stored as numbers, other data as JSON text
+    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value)",
+    """CREATE TABLE environment (
+        id INTEGER PRIMARY KEY,
+        project TEXT NOT NULL,
+        name TEXT NOT NULL,
+        system_packages TEXT NOT NULL,
+        python_version TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        last_used_at REAL NOT NULL,
+        UNIQUE (project, name, system_packages, python_version))""",
+    """CREATE TABLE dep_fp (
+        id INTEGER PRIMARY KEY,
+        filename TEXT NOT NULL,
+        checksums BLOB NOT NULL,
+        UNIQUE (filename, checksums))""",
+    """CREATE TABLE observation (
+        id INTEGER PRIMARY KEY,
+        env_id INTEGER NOT NULL REFERENCES environment(id) ON DELETE CASCADE,
+        test_name TEXT NOT NULL,
+        deps_hash BLOB NOT NULL,
+        dep_count INTEGER NOT NULL CHECK (dep_count > 0),
+        failed INTEGER NOT NULL,
+        duration REAL,
+        superseded INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        last_seen_at REAL NOT NULL,
+        last_used_at REAL NOT NULL,
+        UNIQUE (env_id, test_name, deps_hash))""",
+    """CREATE TABLE observation_dep (
+        observation_id INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
+        fp_id INTEGER NOT NULL REFERENCES dep_fp(id),
+        PRIMARY KEY (observation_id, fp_id)) WITHOUT ROWID""",
+    "CREATE INDEX observation_dep_fp ON observation_dep (fp_id)",
+    # memo of the pure function "fingerprint fp_id is contained in the blocks of content fsha"
+    """CREATE TABLE fp_match (
+        fp_id INTEGER NOT NULL REFERENCES dep_fp(id) ON DELETE CASCADE,
+        fsha TEXT NOT NULL,
+        parser_key TEXT NOT NULL,
+        valid INTEGER NOT NULL,
+        checked_at REAL NOT NULL,
+        PRIMARY KEY (fp_id, fsha, parser_key)) WITHOUT ROWID""",
+    """CREATE TABLE collection_snapshot (
+        env_id INTEGER NOT NULL REFERENCES environment(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        test_names TEXT NOT NULL,
+        recorded_at REAL NOT NULL,
+        PRIMARY KEY (env_id, filename, context_hash)) WITHOUT ROWID""",
+    """CREATE TABLE session (
+        id INTEGER PRIMARY KEY,
+        env_id INTEGER REFERENCES environment(id) ON DELETE SET NULL,
+        started_at REAL NOT NULL,
+        finished_at REAL,
+        pid INTEGER,
+        rootdir_hash TEXT,
+        git_head TEXT,
+        select_mode INTEGER,
+        collect_mode INTEGER,
+        n_collected INTEGER,
+        n_selected INTEGER,
+        n_deselected INTEGER,
+        saved_time REAL,
+        all_time REAL,
+        dropped_batches INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        report TEXT)""",
+)
+
+TEMP_STATEMENTS = (
+    "CREATE TEMP TABLE IF NOT EXISTS tmp_fp "
+    "(filename TEXT, checksums BLOB, PRIMARY KEY (filename, checksums))",
+    "CREATE TEMP TABLE IF NOT EXISTS cur_file (filename TEXT PRIMARY KEY, fsha TEXT)",
+    "CREATE TEMP TABLE IF NOT EXISTS valid_fp (id INTEGER PRIMARY KEY)",
+    "CREATE TEMP TABLE IF NOT EXISTS obs_ids (id INTEGER PRIMARY KEY)",
+    "CREATE TEMP TABLE IF NOT EXISTS snap_keys "
+    "(filename TEXT, context_hash TEXT, PRIMARY KEY (filename, context_hash))",
+)
+
+DepInput = namedtuple("DepInput", "filename checksums fsha")
+"""One dependency of an observation: filename, checksums blob (bytes), content fsha or None."""
+
+ObservationInput = namedtuple("ObservationInput", "test_name deps failed duration")
+
+
+def deps_hash(deps):
+    """Order-independent identity of a dependency set: [(filename, checksums_blob), ...]."""
+    hsh = hashlib.sha256()
+    for filename, blob in sorted(deps):
+        encoded = filename.encode("utf-8", "surrogateescape")
+        hsh.update(len(encoded).to_bytes(4, "little"))
+        hsh.update(encoded)
+        hsh.update(len(blob).to_bytes(4, "little"))
+        hsh.update(blob)
+    return hsh.digest()
+
+
+def _remove_database_files(path):
+    for candidate in (path, path + "-wal", path + "-shm"):
+        try:
+            os.remove(candidate)
+        except FileNotFoundError:
+            pass
 
 
 class DB:  # pylint: disable=too-many-public-methods
-    def __init__(self, datafile, readonly=False):
+    """A connection to a testmon database (one per process, never shared)."""
+
+    def __init__(
+        self,
+        datafile,
+        readonly=False,
+        shared=False,
+        timeout=DEFAULT_TIMEOUT,
+    ):
+        self.datafile = os.fspath(datafile)
         self._readonly = readonly
-        file_exists = os.path.exists(datafile)
+        self.shared = shared
+        self.timeout = timeout
+        self.con = None
+        self.file_created = False
+        try:
+            self._open()
+        except sqlite3.Error as exc:
+            self._close_quietly()
+            raise DbError.from_sqlite(exc) from exc
+        except BaseException:
+            self._close_quietly()
+            raise
 
-        connection = connect(datafile, readonly)
-        connection, old_format = check_data_version(
-            connection, datafile, self.version_compatibility()
+    # ---------------------------------------------------------------- connection lifecycle
+
+    def _connect(self):
+        if self._readonly:
+            from urllib.parse import quote  # pylint: disable=import-outside-toplevel
+
+            return sqlite3.connect(
+                f"file:{quote(os.path.abspath(self.datafile))}?mode=ro",
+                uri=True,
+                timeout=self.timeout,
+                isolation_level=None,
+            )
+        return sqlite3.connect(
+            self.datafile, timeout=self.timeout, isolation_level=None
         )
-        self.con = connection_options(connection)
 
-        if (not file_exists) or old_format:
-            self.init_tables()
-            self.file_created = True
-        else:
-            self.file_created = False
+    def _configure(self, con):
+        con.row_factory = sqlite3.Row
+        con.execute(f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
+        con.execute("PRAGMA foreign_keys = ON")
+        if not self._readonly:
+            if not con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
+                # must precede the first table; ignored afterwards
+                con.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            mode = con.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if str(mode).lower() != "wal" and self.shared:
+                raise DbError("db_error", f"could not enable WAL mode (got {mode})")
+            con.execute("PRAGMA synchronous = NORMAL")
+            con.execute("PRAGMA journal_size_limit = 67108864")
+        for statement in TEMP_STATEMENTS:
+            con.execute(statement)
 
-        self.con.executescript(self._local_temp_tables_statement())
+    def _open(self):
+        if self.shared and not self._readonly:
+            secure_location(self.datafile)
+        self.con = self._connect()
+        self._configure(self.con)
+        app_id = self.con.execute("PRAGMA application_id").fetchone()[0]
+        version = self.con.execute("PRAGMA user_version").fetchone()[0]
+        has_tables = self.con.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        ).fetchone()[0]
+        if not has_tables and app_id == 0 and version == 0:
+            if self._readonly:
+                raise DbError("open_failed", f"{self.datafile} is empty")
+            self.file_created = self._initialize()
+            app_id = APPLICATION_ID
+        elif app_id != APPLICATION_ID:
+            if self.shared or self._readonly:
+                raise DbError(
+                    "foreign_db",
+                    f"{self.datafile} is not a database of this testmon fork "
+                    f"(application_id={app_id}, user_version={version}); refusing to modify it",
+                )
+            # a private .testmondata in upstream's (or another) format: recreate, like upstream
+            self.con.close()
+            _remove_database_files(self.datafile)
+            self.con = self._connect()
+            self._configure(self.con)
+            self.file_created = self._initialize()
+        self._check_schema()
+
+    def _initialize(self):
+        def body(con):
+            if con.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+            ).fetchone()[0]:
+                return (
+                    False  # another process initialized it while we waited for the lock
+                )
+            for statement in SCHEMA_STATEMENTS:
+                con.execute(statement)
+            con.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+            con.execute(f"PRAGMA user_version = {DATA_VERSION}")
+            con.execute(
+                "INSERT INTO metadata (key, value) VALUES ('compat_version', ?)",
+                (COMPAT_VERSION,),
+            )
+            con.execute(
+                "INSERT INTO metadata (key, value) VALUES ('created_at', ?)", (now(),)
+            )
+            return True
+
+        return self._write(body, begin="EXCLUSIVE")
+
+    def _check_schema(self):
+        version = self.con.execute("PRAGMA user_version").fetchone()[0]
+        if version == DATA_VERSION:
+            return
+        if version > DATA_VERSION:
+            compat = self._compat_version(default=version)
+            if compat > DATA_VERSION:
+                raise DbError(
+                    "incompatible_schema",
+                    f"database schema {version} requires a testmon supporting schema "
+                    f">= {compat}; this testmon supports {DATA_VERSION}",
+                )
+            return  # newer, but only additively: usable
+        if self._readonly:
+            raise DbError(
+                "incompatible_schema",
+                f"database schema {version} is older than {DATA_VERSION} (read-only)",
+            )
+        if not self._migration_path_exists(version):
+            if self.shared:
+                raise DbError(
+                    "incompatible_schema",
+                    f"database schema {version} cannot be migrated to {DATA_VERSION}; "
+                    "refusing to modify the shared database",
+                )
+            # private database without a migration path: recreate it, like upstream
+            self.con.close()
+            _remove_database_files(self.datafile)
+            self.con = self._connect()
+            self._configure(self.con)
+            self.file_created = self._initialize()
+            return
+        self.migrate()
+
+    @staticmethod
+    def _migration_path_exists(version):
+        reachable = version
+        for step in sorted(MIGRATIONS):
+            if reachable < step <= DATA_VERSION:
+                reachable = step
+        return reachable == DATA_VERSION
+
+    def _compat_version(self, default):
+        row = self.con.execute(
+            "SELECT value FROM metadata WHERE key = 'compat_version'"
+        ).fetchone()
+        try:
+            return int(row[0]) if row else default
+        except (TypeError, ValueError):
+            return default
+
+    def migrate(self):
+        """Apply pending MIGRATIONS; safe to call concurrently from several processes."""
+
+        def body(con):
+            current = con.execute("PRAGMA user_version").fetchone()[0]
+            applied = []
+            for version in sorted(MIGRATIONS):
+                if current < version <= DATA_VERSION:
+                    migrate_fn, compat = MIGRATIONS[version]
+                    migrate_fn(con)
+                    con.execute(f"PRAGMA user_version = {int(version)}")
+                    old_compat = self._compat_version(default=COMPAT_VERSION)
+                    con.execute(
+                        "INSERT INTO metadata (key, value) VALUES ('compat_version', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (max(old_compat, compat),),
+                    )
+                    con.execute(
+                        "INSERT INTO metadata (key, value) VALUES ('migrations_applied', 1) "
+                        "ON CONFLICT(key) DO UPDATE SET value = value + 1"
+                    )
+                    current = version
+                    applied.append(version)
+            return applied
+
+        return self._write(body, begin="EXCLUSIVE")
 
     def version_compatibility(self):
         return DATA_VERSION
 
+    def _close_quietly(self):
+        if self.con is not None:
+            try:
+                self.con.close()
+            except sqlite3.Error:
+                pass
+            self.con = None
+
     def close(self):
-        self.con.close()
+        self._close_quietly()
 
     def __enter__(self):
         return self
@@ -88,639 +515,636 @@ class DB:  # pylint: disable=too-many-public-methods
     def __exit__(self, *args):
         self.close()
 
-    def _test_execution_fk_column(self) -> str:
-        return "environment_id"
+    # ---------------------------------------------------------------- transactions
 
-    def _test_execution_fk_table(self) -> str:
-        return "environment"
+    def _write(self, body, begin="IMMEDIATE"):
+        """Run body(con) in a write transaction, retrying the whole body when busy."""
+        if self._readonly:
+            raise DbError("permission", "the connection is read-only")
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            try:
+                self.con.execute(f"BEGIN {begin}")
+                try:
+                    result = body(self.con)
+                    self.con.execute("COMMIT")
+                    return result
+                except BaseException:
+                    if self.con.in_transaction:
+                        try:
+                            self.con.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    raise
+            except sqlite3.OperationalError as exc:
+                if _is_busy(exc) and attempt < WRITE_ATTEMPTS:
+                    time.sleep(random.uniform(0.05, 0.25) * attempt)
+                    continue
+                raise DbError.from_sqlite(exc) from exc
+            except sqlite3.Error as exc:
+                raise DbError.from_sqlite(exc) from exc
+        raise AssertionError("unreachable")  # pragma: no cover
 
-    def update_mtimes(self, new_mtimes):
-        with self.con as con:
-            con.executemany(
-                "UPDATE file_fp SET mtime=?, fsha=? WHERE id = ?", new_mtimes
-            )
+    def write(self, body):
+        """Public form of _write for callers outside this module (admin, tests)."""
+        return self._write(body)
 
-    def finish_execution(self, exec_id, duration=None, select=True):  # pylint: disable=unused-argument
-        self.update_saving_stats(exec_id, select)
-        self.fetch_or_create_file_fp.cache_clear()
-        with self.con as con:
-            self.vacuum_file_fp(con)
-
-    def vacuum_file_fp(self, con):
-        con.execute(
-            """ DELETE FROM file_fp
-                WHERE id NOT IN (
-                    SELECT DISTINCT fingerprint_id FROM test_execution_file_fp) """
-        )
-
-    def fetch_current_run_stats(self, exec_id):
-        with self.con as con:
-            cursor = con.cursor()
-            run_saved_tests, run_saved_time = cursor.execute(
-                f"""
-                    SELECT count(*), sum(te.duration) FROM test_execution te
-                    WHERE te.forced IS NOT False
-                    AND te.{self._test_execution_fk_column()} = ?
-                """,
-                (exec_id,),
-            ).fetchone()
-            run_all_tests, run_all_time = cursor.execute(
-                f"""
-                    SELECT count(*), sum(te.duration) FROM test_execution te
-                    WHERE te.{self._test_execution_fk_column()} = ?
-                """,
-                (exec_id,),
-            ).fetchone()
-
-        return (
-            run_saved_time,
-            run_all_time,
-            run_saved_tests,
-            run_all_tests,
-        )
-
-    def update_saving_stats(self, exec_id, select):
-        (
-            run_saved_time,
-            run_all_time,
-            run_saved_tests,
-            run_all_tests,
-        ) = self.fetch_current_run_stats(exec_id)
-
-        attribute_prefix = "" if select else "potential_"
-        self.increment_attributes(
-            {
-                f"{attribute_prefix}time_saved": run_saved_time,
-                f"{attribute_prefix}time_all": run_all_time,
-                f"{attribute_prefix}tests_saved": run_saved_tests,
-                f"{attribute_prefix}tests_all": run_all_tests,
-            },
-            exec_id=None,
-        )
-
-    def fetch_saving_stats(self, exec_id, select):
-        (
-            run_saved_time,
-            run_all_time,
-            run_saved_tests,
-            run_all_tests,
-        ) = self.fetch_current_run_stats(exec_id)
-        attribute_prefix = "" if select else "potential_"
-        total_saved_time = self.fetch_attribute(
-            attribute=f"{attribute_prefix}time_saved", default=0, exec_id=None
-        )
-        total_all_time = self.fetch_attribute(
-            attribute=f"{attribute_prefix}time_all", default=0, exec_id=None
-        )
-        total_saved_tests = self.fetch_attribute(
-            attribute=f"{attribute_prefix}tests_saved", default=0, exec_id=None
-        )
-        total_all_tests = self.fetch_attribute(
-            attribute=f"{attribute_prefix}tests_all", default=0, exec_id=None
-        )
-
-        return (
-            run_saved_time,
-            run_all_time,
-            run_saved_tests,
-            run_all_tests,
-            total_saved_time,
-            total_all_time,
-            total_saved_tests,
-            total_all_tests,
-        )
-
-    @lru_cache(1000)
-    def fetch_or_create_file_fp(self, filename, fsha, method_checksums):  # pylint: disable=R0801
-        cursor = self.con.cursor()
+    @contextmanager
+    def read_snapshot(self):
+        """A consistent read view (WAL snapshot); temp tables may be written inside it."""
         try:
-            cursor.execute(
-                """
-                INSERT INTO file_fp
-                (filename, method_checksums, fsha)
-                VALUES (?, ?, ?)
-                """,
-                (filename, method_checksums, fsha),
-            )
+            self.con.execute("BEGIN DEFERRED")
+        except sqlite3.Error as exc:
+            raise DbError.from_sqlite(exc) from exc
+        try:
+            yield self.con
+        except sqlite3.Error as exc:
+            raise DbError.from_sqlite(exc) from exc
+        finally:
+            if self.con is not None and self.con.in_transaction:
+                try:
+                    self.con.execute("COMMIT")
+                except sqlite3.Error:
+                    self.con.execute("ROLLBACK")
 
-            fingerprint_id = cursor.lastrowid
-        except sqlite3.IntegrityError:  # rather fetching existing fingerprint
-            fingerprint_id, *_ = cursor.execute(
-                """
-                SELECT
-                    id
-                FROM
-                    file_fp
-                WHERE
-                    filename = ? AND fsha = ? AND method_checksums = ?
-                """,
-                (filename, fsha, method_checksums),
-            ).fetchone()
+    def _read(self, sql, params=()):
+        try:
+            return self.con.execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            raise DbError.from_sqlite(exc) from exc
 
-        return fingerprint_id
-
-    def _insert_test_execution(  # pylint: disable=too-many-arguments
-        self,
-        con,
-        exec_id: int,
-        test_name: "str",
-        duration: "float",
-        failed: "bool",
-        forced: bool,
-    ) -> int:
-        cursor = con.cursor()
-        cursor.execute(
-            f"""
-                INSERT INTO test_execution
-                ({self._test_execution_fk_column()}, test_name, duration, failed, forced)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-            (
-                exec_id,
-                test_name,
-                duration,
-                1 if failed else 0,
-                forced,
-            ),
-        )
-        return cursor.lastrowid
-
-    def insert_test_file_fps(self, tests_deps_n_outcomes: TestExecutions, exec_id=None):
-        assert exec_id
-        with self.con as con:
-            cursor = con.cursor()
-
-            cursor.executemany(
-                f"DELETE FROM test_execution_file_fp "
-                f"WHERE test_execution_id in "
-                f"      (SELECT id FROM test_execution WHERE {self._test_execution_fk_column()}=? AND test_name=?)",
-                [(exec_id, test_name) for test_name in tests_deps_n_outcomes],
-            )
-
-            cursor.executemany(
-                f"DELETE FROM test_execution WHERE {self._test_execution_fk_column()}=? AND test_name=?",
-                [(exec_id, test_name) for test_name in tests_deps_n_outcomes],
-            )
-
-            test_execution_file_fps = []
-            for test_name, deps_n_outcomes in tests_deps_n_outcomes.items():
-                te_id = self._insert_test_execution(
-                    con,
-                    exec_id,
-                    test_name,
-                    deps_n_outcomes.get("duration", None),
-                    deps_n_outcomes.get("failed", None),
-                    deps_n_outcomes.get("forced", None),
-                )
-
-                fingerprints = deps_n_outcomes["deps"]
-                files_fshas = set()
-                for record in fingerprints:
-                    fingerprint_id = self.fetch_or_create_file_fp(
-                        record["filename"],
-                        record["fsha"],
-                        checksums_to_blob(record["method_checksums"]),
-                    )
-
-                    test_execution_file_fps.append((te_id, fingerprint_id))
-                    files_fshas.add((record["filename"], record["fsha"]))
-            if test_execution_file_fps:
-                cursor.executemany(
-                    "INSERT INTO test_execution_file_fp VALUES (?, ?)",
-                    test_execution_file_fps,
-                )
-                self.fetch_or_create_file_fp.cache_clear()
-                self.insert_into_suite_files_fshas(con, exec_id, files_fshas)
-
-    def insert_into_suite_files_fshas(self, con, exec_id, files_fshas):
-        pass
+    # ---------------------------------------------------------------- metadata
 
     def write_attribute(self, attribute, data, exec_id=None):
-        dataid = f"{exec_id}:{attribute}"
-        with self.con as con:
-            con.execute(
-                "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-                [dataid, json.dumps(data)],
+        key = f"{exec_id}:{attribute}"
+        self._write(
+            lambda con: con.execute(
+                "INSERT INTO metadata (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, json.dumps(data)),
             )
+        )
 
     def fetch_attribute(self, attribute, default=None, exec_id=None):
-        cursor = self.con.execute(
-            "SELECT data FROM metadata WHERE dataid=?",
-            [f"{exec_id}:{attribute}"],
+        rows = self._read(
+            "SELECT value FROM metadata WHERE key = ?", (f"{exec_id}:{attribute}",)
         )
-        result = cursor.fetchone()
-        if result:
-            return json.loads(result[0])  # zlib.decompress(result[0]).decode('utf-8)'))
-        return default
+        if not rows:
+            return default
+        value = rows[0][0]
+        if isinstance(value, (int, float)) or value is None:
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
 
     def increment_attributes(self, attributes_to_increment, exec_id=None):
-        def sum_with_none(*to_sum):
-            return sum(filter(None, to_sum))
+        """Atomic counter increments (one statement each, one transaction)."""
+        rows = [
+            (f"{exec_id}:{name}", value or 0)
+            for name, value in attributes_to_increment.items()
+        ]
 
-        for attribute_name in attributes_to_increment:
-            dataid = f"{exec_id}:{attribute_name}"
-            old_value = self.fetch_attribute(
-                attribute=attribute_name, default=0, exec_id=exec_id
-            )
-            with self.con as con:
-                con.execute(
-                    "INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-                    [
-                        dataid,
-                        sum_with_none(
-                            old_value, attributes_to_increment[attribute_name]
-                        ),
-                    ],
-                )
-
-    def _create_metadata_statement(self) -> str:
-        return """CREATE TABLE metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
-
-    def _create_environment_statement(self) -> str:
-        return """
-                CREATE TABLE environment (
-                id INTEGER PRIMARY KEY ASC,
-                environment_name TEXT,
-                system_packages TEXT,
-                python_version TEXT,
-                UNIQUE (environment_name, system_packages, python_version)
-            );"""
-
-    def _create_test_execution_statement(self) -> str:  # pylint: disable=invalid-name
-        return f"""
-                CREATE TABLE test_execution (
-                id INTEGER PRIMARY KEY ASC,
-                {self._test_execution_fk_column()} INTEGER,
-                test_name TEXT,
-                duration FLOAT,
-                failed BIT,
-                forced BIT,
-                FOREIGN KEY({self._test_execution_fk_column()}) REFERENCES {self._test_execution_fk_table()}(id) ON DELETE CASCADE);
-                CREATE INDEX test_execution_fk_name ON test_execution ({self._test_execution_fk_column()}, test_name);
-            """
-
-    def _create_temp_tables_statement(self) -> str:
-        return ""
-
-    def _local_temp_tables_statement(self) -> str:
-        return """
-                CREATE TEMPORARY TABLE changed_files_fshas (exec_id INTEGER, filename TEXT, fsha TEXT);
-                CREATE INDEX changed_files_fshas_mcall ON changed_files_fshas (exec_id, filename, fsha);
-
-                CREATE TEMPORARY TABLE changed_files_mhashes (exec_id INTEGER, filename TEXT, mhashes BLOB);
-                CREATE INDEX changed_files_mhashes_eid ON changed_files_mhashes (exec_id);
-        """
-
-    def _create_file_fp_statement(self) -> str:
-        return """
-            CREATE TABLE file_fp
-            (
-                id INTEGER PRIMARY KEY,
-                filename TEXT,
-                method_checksums BLOB,
-                mtime FLOAT,
-                fsha TEXT,
-                UNIQUE (filename, fsha, method_checksums)
-            );"""
-
-    def _create_test_execution_ffp_statement(  # pylint: disable=invalid-name
-        self,
-    ) -> str:
-        return """
-            CREATE TABLE test_execution_file_fp (
-                test_execution_id INTEGER,
-                fingerprint_id INTEGER,
-                PRIMARY KEY (test_execution_id, fingerprint_id),
-                FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
-                FOREIGN KEY(fingerprint_id) REFERENCES file_fp(id)
-            ) WITHOUT ROWID;
-            -- Index the child key used when deleting orphaned fingerprints.
-            CREATE INDEX test_execution_file_fp_fingerprint_id ON test_execution_file_fp (fingerprint_id);
-            -- the following table stores the same data coarsely, but is used for faster queries
-            CREATE TABLE suite_execution_file_fsha (
-                suite_execution_id INTEGER,
-                filename TEXT,
-                fsha text,
-                FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id) ON DELETE CASCADE
-                );
-                CREATE UNIQUE INDEX sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
-            """
-
-    def init_tables(self):
-        connection = self.con
-
-        connection.executescript(
-            self._create_metadata_statement()
-            + self._create_environment_statement()
-            + self._create_test_execution_statement()
-            + self._create_temp_tables_statement()
-            + self._create_file_fp_statement()
-            + self._create_test_execution_ffp_statement()
-        )
-
-        connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
-
-    def fetch_changed_file_data(self, changed_fingerprints, exec_id) -> []:
-        in_clause_questionsmarks = ", ".join("?" * len(changed_fingerprints))
-        result = []
-        for row in self.con.execute(
-            f"""
-            SELECT
-                f.filename,
-                te.test_name,
-                f.method_checksums,
-                f.id,
-                te.failed,
-                te.duration
-            FROM test_execution te, test_execution_file_fp te_ffp, file_fp f
-            WHERE
-                te.{self._test_execution_fk_column()} = ? AND
-                te.id = te_ffp.test_execution_id AND
-                te_ffp.fingerprint_id = f.id AND
-                f.id IN ({in_clause_questionsmarks})
-            """,
-            [
-                exec_id,
-            ]
-            + list(changed_fingerprints),
-        ):
-            result.append(
-                [
-                    row["filename"],
-                    row["test_name"],
-                    blob_to_checksums(row["method_checksums"]),
-                    row["id"],
-                    row["failed"],
-                    row["duration"],
-                ]
-            )
-
-        return result
-
-    def fetch_unknown_files(
-        self, files_fshas, exec_id
-    ) -> []:  # exec_id is environment_id in this module
-        with self.con as con:
-            con.execute("DELETE FROM changed_files_fshas WHERE exec_id = ?", (exec_id,))
+        def body(con):
             con.executemany(
-                "INSERT INTO changed_files_fshas VALUES (?, ?, ?)",
-                [(exec_id, file, fsha) for file, fsha in files_fshas.items()],
-            )
-            return self._fetch_unknown_files_from_one_v(con, exec_id, exec_id)
-
-    def _fetch_unknown_files_from_one_v(self, con, exec_id, files_shas_id):
-        result = []
-        for row in con.execute(
-            f"""
-                SELECT DISTINCT
-                    f.filename
-                FROM test_execution te, test_execution_file_fp te_ffp, file_fp f
-                LEFT OUTER JOIN changed_files_fshas chff
-                ON f.filename = chff.filename and f.fsha = chff.fsha AND chff.exec_id = :files_shas_id
-                WHERE
-                    te.{self._test_execution_fk_column()} = :exec_id AND
-                    te.id = te_ffp.test_execution_id AND
-                    te_ffp.fingerprint_id = f.id AND
-                    (f.fsha IS NULL OR chff.fsha IS NULL)
-                """,
-            {"files_shas_id": files_shas_id, "exec_id": exec_id},
-        ):
-            result.append(row["filename"])
-        return result
-
-    def delete_filenames(self, con):
-        con.execute("DELETE FROM changed_files_mhashes")
-
-    def determine_tests(self, exec_id, files_mhashes):
-        with self.con as con:
-            if not self._readonly:
-                con.execute(
-                    f"UPDATE test_execution set forced = NULL WHERE {self._test_execution_fk_column()} = ?",
-                    [exec_id],
-                )
-            self.delete_filenames(con)
-            con.executemany(
-                "INSERT INTO changed_files_mhashes VALUES (?, ?, ?)",
-                [
-                    (exec_id, file, checksums_to_blob(mhashes) if mhashes else None)
-                    for file, mhashes in files_mhashes.items()
-                ],
+                "INSERT INTO metadata (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = coalesce(value, 0) + excluded.value",
+                rows,
             )
 
-            results = []
-            for row in self.con.execute(
-                f"""
-                SELECT
-                    f.filename,
-                    te.test_name,
-                    f.method_checksums,
-                    te.failed,
-                    te.duration
-                FROM test_execution te, test_execution_file_fp te_ffp, file_fp f, changed_files_mhashes chfm
-                WHERE
-                    chfm.exec_id = ? AND
-                    te.{self._test_execution_fk_column()} = ? AND
-                    te.id = te_ffp.test_execution_id AND
-                    te_ffp.fingerprint_id = f.id AND
-                    chfm.filename = f.filename
-                """,
-                [exec_id, exec_id],
-            ):
-                results.append(
-                    [
-                        row["filename"],
-                        row["test_name"],
-                        blob_to_checksums(row["method_checksums"]),
-                    ]
-                )
+        self._write(body)
 
-            method_misses = []
-            for result in results:
-                if not check_fingerprint_db(files_mhashes, result[0], result[2]):
-                    method_misses.append(result[1])
-
-            failing_tests = [
-                row["test_name"]
-                for row in self.con.execute(
-                    f"""
-                    SELECT
-                        te.test_name
-                    FROM test_execution te
-                    WHERE
-                        te.{self._test_execution_fk_column()} = ? AND
-                        te.failed = 1
-                    """,
-                    [exec_id],
-                )
-            ]
-
-            return {"affected": method_misses, "failing": failing_tests}
-
-    def delete_test_executions(self, test_names, exec_id):
-        with self.con as con:
-            con.executemany(
-                f"""
-                DELETE
-                FROM test_execution_file_fp
-                WHERE test_execution_id IN
-                    (SELECT id FROM test_execution WHERE {self._test_execution_fk_column()} = ? AND test_name = ?)
-                    """,
-                [(exec_id, test_name) for test_name in test_names],
-            )
-            con.executemany(
-                f"""
-                DELETE
-                FROM test_execution
-                WHERE {self._test_execution_fk_column()} = ?
-                  AND test_name = ?""",
-                [(exec_id, test_name) for test_name in test_names],
-            )
-
-    def all_test_executions(self, exec_id):
-        return {
-            row[0]: {"duration": row[1], "failed": row[2], "forced": row[3]}
-            for row in self.con.execute(
-                f"""
-                SELECT
-                    test_name, duration, failed, forced
-                FROM test_execution
-                WHERE {self._test_execution_fk_column()} = ?
-                """,
-                (exec_id,),
-            )
-        }
-
-    def filenames(self, exec_id):
-        cursor = self.con.execute(
-            f"""
-            SELECT DISTINCT
-                f.filename
-            FROM
-                file_fp f, test_execution_file_fp te_ffp, test_execution te
-            WHERE
-                te.id = te_ffp.test_execution_id AND
-                te_ffp.fingerprint_id = f.id AND
-                te.{self._test_execution_fk_column()} = ?
-                """,
-            (exec_id,),
-        )
-
-        return [row[0] for row in cursor]
-
-    # TODO unify with filenames? Restrict not to go into ancient history, but not miss combinations?
-    def all_filenames(self):
-        cursor = self.con.execute(
-            """
-            SELECT DISTINCT
-                f.filename
-            FROM
-                file_fp f
-                """,
-        )
-
-        return [row[0] for row in cursor]
-
-    def filenames_fingerprints(self, exec_id):
-        cursor = self.con.execute(
-            f"""
-            SELECT DISTINCT
-                f.filename,
-                f.mtime,
-                f.fsha,
-                f.id as fingerprint_id,
-                sum(failed)
-            FROM
-                test_execution te, test_execution_file_fp te_ffp, file_fp f
-            WHERE
-                te.id = te_ffp.test_execution_id AND
-                te_ffp.fingerprint_id = f.id AND
-                {self._test_execution_fk_column()} = ?
-            GROUP BY
-                f.filename, f.mtime, f.fsha, f.id
-            """,
-            (exec_id,),
-        )
-
-        return [dict(row) for row in cursor]
+    # ---------------------------------------------------------------- environments
 
     def fetch_or_create_environment(
-        self, environment_name, system_packages, python_version
+        self, environment_name, system_packages, python_version, project=""
     ):
-        with self.con as con:
-            con.execute("BEGIN IMMEDIATE TRANSACTION")
-            cursor = con.cursor()
-            environment = cursor.execute(
-                """
-                SELECT
-                id, environment_name, system_packages, python_version
-                FROM environment
-                WHERE environment_name = ?
-                ORDER BY id DESC
-                """,
-                (environment_name,),
-            ).fetchone()  # TODO to pick best environment of many with the same name, we would need to fetch all.
+        """Return (env_id, packages_changed). Environments are never deleted here.
 
-            if environment:
-                environment_id = environment["id"]
-                packages_changed = (
-                    environment["system_packages"] != system_packages
-                    or environment["python_version"] != python_version
-                )
-            else:
-                packages_changed = False
-            if not environment:
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO environment (environment_name, system_packages, python_version)
-                        VALUES (?, ?, ?)
-                        """,
-                        (
-                            environment_name,
-                            system_packages,
-                            python_version,
-                        ),
-                    )
-                    environment_id = cursor.lastrowid
-                except sqlite3.IntegrityError:
-                    environment = con.execute(
-                        """
-                        SELECT
-                        id as id, environment_name as name, system_packages as packages
-                        FROM environment
-                        WHERE environment_name = ?
-                        """,
-                        (environment_name,),
-                    ).fetchone()
-                    environment_id = environment["id"]
-            elif packages_changed:
-                cursor.execute(
-                    """
-                    INSERT INTO environment (environment_name, system_packages, python_version)
-                    VALUES (?, ?, ?)
-                    """,
-                    (environment_name, system_packages, python_version),
-                )
-                new_environment_id = cursor.lastrowid
-                cursor.execute(
-                    "DELETE FROM environment WHERE id = ?", (environment_id,)
-                )
-                environment_id = new_environment_id
+        packages_changed is True when this exact environment is new but the same
+        (project, name) was seen with other packages/Python (upstream's "packages changed").
+        """
+        key = (
+            project or "",
+            environment_name,
+            system_packages or "",
+            python_version or "",
+        )
+        rows = self._read(
+            "SELECT id, last_used_at FROM environment WHERE project = ? AND name = ? "
+            "AND system_packages = ? AND python_version = ?",
+            key,
+        )
+        if rows and rows[0]["last_used_at"] > now() - LAST_USED_GRANULARITY:
+            return rows[0]["id"], False
 
-            return environment_id, packages_changed
+        def body(con):
+            timestamp = now()
+            row = con.execute(
+                "SELECT id FROM environment WHERE project = ? AND name = ? "
+                "AND system_packages = ? AND python_version = ?",
+                key,
+            ).fetchone()
+            if row:
+                con.execute(
+                    "UPDATE environment SET last_used_at = ? WHERE id = ?",
+                    (timestamp, row[0]),
+                )
+                return row[0], False
+            other = con.execute(
+                "SELECT 1 FROM environment WHERE project = ? AND name = ? LIMIT 1",
+                key[:2],
+            ).fetchone()
+            cursor = con.execute(
+                "INSERT INTO environment (project, name, system_packages, python_version, "
+                "created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?)",
+                key + (timestamp, timestamp),
+            )
+            return cursor.lastrowid, bool(other)
 
-    def initiate_execution(  # pylint: disable= R0913 W0613
+        return self._write(body)
+
+    def initiate_execution(  # pylint: disable=unused-argument
         self,
-        environment_name: str,
-        system_packages: str,
-        python_version: str,
-        execution_metadata: dict,  # pylint: disable=unused-argument
-    ) -> [int, list]:  # exec_id  # changed_file_data  # future_string2
+        environment_name,
+        system_packages,
+        python_version,
+        execution_metadata=None,
+        project="",
+    ):
         exec_id, packages_changed = self.fetch_or_create_environment(
-            environment_name, system_packages, python_version
+            environment_name, system_packages, python_version, project=project
         )
         return {
             "exec_id": exec_id,
-            "filenames": self.all_filenames(),
+            "filenames": None,
             "packages_changed": packages_changed,
+        }
+
+    # ---------------------------------------------------------------- sessions
+
+    def start_session(self, env_id, select, collect, rootdir_hash=None, git_head=None):
+        def body(con):
+            cursor = con.execute(
+                "INSERT INTO session (env_id, started_at, pid, rootdir_hash, git_head, "
+                "select_mode, collect_mode, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'running')",
+                (
+                    env_id,
+                    now(),
+                    os.getpid(),
+                    rootdir_hash,
+                    git_head,
+                    int(select),
+                    int(collect),
+                ),
+            )
+            return cursor.lastrowid
+
+        return self._write(body)
+
+    def finish_session(self, session_id, status="finished", **counters):
+        columns = {
+            key: counters[key]
+            for key in (
+                "n_collected",
+                "n_selected",
+                "n_deselected",
+                "saved_time",
+                "all_time",
+                "dropped_batches",
+                "report",
+            )
+            if key in counters
+        }
+        assignments = ", ".join(f"{column} = ?" for column in columns)
+
+        def body(con):
+            con.execute(
+                f"UPDATE session SET finished_at = ?, status = ?"
+                f"{', ' + assignments if assignments else ''} WHERE id = ?",
+                (now(), status, *columns.values(), session_id),
+            )
+
+        self._write(body)
+
+    def mark_stale_sessions(self):
+        """Mark sessions of processes that died without finishing (kill -9) as interrupted."""
+        rows = self._read("SELECT id, pid FROM session WHERE status = 'running'")
+        dead = []
+        for row in rows:
+            if row["pid"] == os.getpid():
+                continue
+            try:
+                os.kill(row["pid"], 0)
+            except ProcessLookupError:
+                dead.append((row["id"],))
+            except (PermissionError, OSError, TypeError):
+                continue
+        if dead:
+            self._write(
+                lambda con: con.executemany(
+                    "UPDATE session SET status = 'interrupted' "
+                    "WHERE id = ? AND status = 'running'",
+                    dead,
+                )
+            )
+        return len(dead)
+
+    # ---------------------------------------------------------------- observations: write
+
+    def record_observations(self, env_id, observations, supersede=None):
+        """Store a batch of observations atomically; returns the number stored.
+
+        supersede maps test_name -> ids of failing observations that were valid at the start
+        of this session; when the test now passes they are marked superseded.
+        """
+        prepared = []
+        for obs in observations:
+            deps = {}
+            for dep in obs.deps:
+                deps[(dep.filename, bytes(dep.checksums))] = dep.fsha
+            if not deps:
+                continue
+            prepared.append((obs, deps, deps_hash(deps.keys())))
+        if not prepared:
+            return 0
+        pairs = sorted({key for _, deps, _ in prepared for key in deps})
+        pkey = parser_key()
+
+        def body(con):
+            timestamp = now()
+            con.execute("DELETE FROM temp.tmp_fp")
+            con.executemany(
+                "INSERT OR IGNORE INTO temp.tmp_fp (filename, checksums) VALUES (?, ?)",
+                pairs,
+            )
+            con.execute(
+                "INSERT OR IGNORE INTO dep_fp (filename, checksums) "
+                "SELECT filename, checksums FROM temp.tmp_fp"
+            )
+            fp_ids = {
+                (row[1], bytes(row[2])): row[0]
+                for row in con.execute(
+                    "SELECT f.id, f.filename, f.checksums FROM dep_fp f JOIN temp.tmp_fp t "
+                    "ON t.filename = f.filename AND t.checksums = f.checksums"
+                )
+            }
+            for obs, deps, digest in prepared:
+                con.execute(
+                    "INSERT INTO observation (env_id, test_name, deps_hash, dep_count, failed, "
+                    "duration, superseded, created_at, last_seen_at, last_used_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?) "
+                    "ON CONFLICT(env_id, test_name, deps_hash) DO UPDATE SET "
+                    "failed = excluded.failed, duration = excluded.duration, superseded = 0, "
+                    "last_seen_at = excluded.last_seen_at",
+                    (
+                        env_id,
+                        obs.test_name,
+                        digest,
+                        len(deps),
+                        1 if obs.failed else 0,
+                        obs.duration,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                obs_id = con.execute(
+                    "SELECT id FROM observation WHERE env_id = ? AND test_name = ? "
+                    "AND deps_hash = ?",
+                    (env_id, obs.test_name, digest),
+                ).fetchone()[0]
+                con.executemany(
+                    "INSERT OR IGNORE INTO observation_dep (observation_id, fp_id) VALUES (?, ?)",
+                    [(obs_id, fp_ids[key]) for key in deps],
+                )
+                con.executemany(
+                    "INSERT OR IGNORE INTO fp_match (fp_id, fsha, parser_key, valid, checked_at) "
+                    "VALUES (?, ?, ?, 1, ?)",
+                    [
+                        (fp_ids[key], fsha, pkey, timestamp)
+                        for key, fsha in deps.items()
+                        if fsha
+                    ],
+                )
+                if not obs.failed and supersede:
+                    candidates = [
+                        (candidate,)
+                        for candidate in supersede.get(obs.test_name, ())
+                        if candidate != obs_id
+                    ]
+                    con.executemany(
+                        "UPDATE observation SET superseded = 1 WHERE id = ? AND failed = 1",
+                        candidates,
+                    )
+            _fault("mid_write")
+            return len(prepared)
+
+        stored = self._write(body)
+        _commits["observations"] += 1
+        _fault("after_commit")
+        return stored
+
+    def insert_test_file_fps(self, tests_deps_n_outcomes, exec_id=None, supersede=None):
+        """Upstream-format adapter: {test: {"deps": [{filename, method_checksums, fsha}], ...}}."""
+        assert exec_id
+        observations = []
+        for test_name, deps_n_outcomes in tests_deps_n_outcomes.items():
+            deps = tuple(
+                DepInput(
+                    record["filename"],
+                    checksums_to_blob(record["method_checksums"]),
+                    record.get("fsha"),
+                )
+                for record in deps_n_outcomes["deps"]
+            )
+            observations.append(
+                ObservationInput(
+                    test_name,
+                    deps,
+                    bool(deps_n_outcomes.get("failed")),
+                    deps_n_outcomes.get("duration"),
+                )
+            )
+        return self.record_observations(exec_id, observations, supersede=supersede)
+
+    def record_selection_side_effects(self, new_memo, used_observation_ids):
+        """Persist fp_match results computed during selection and bump last_used_at."""
+        if not new_memo and not used_observation_ids:
+            return
+        pkey = parser_key()
+
+        def body(con):
+            timestamp = now()
+            con.executemany(
+                "INSERT OR IGNORE INTO fp_match (fp_id, fsha, parser_key, valid, checked_at) "
+                "SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM dep_fp WHERE id = ?)",
+                [
+                    (fp_id, fsha, pkey, valid, timestamp, fp_id)
+                    for fp_id, fsha, valid in new_memo
+                ],
+            )
+            con.executemany(
+                "UPDATE observation SET last_used_at = ? WHERE id = ? AND last_used_at < ?",
+                [
+                    (timestamp, obs_id, timestamp - LAST_USED_GRANULARITY)
+                    for obs_id in used_observation_ids
+                ],
+            )
+
+        self._write(body)
+
+    # ---------------------------------------------------------------- collection snapshots
+
+    def record_collection_snapshots(self, env_id, snapshots):
+        """snapshots: [(filename, context_hash, [test names])]"""
+        if not snapshots:
+            return
+
+        def body(con):
+            timestamp = now()
+            con.executemany(
+                "INSERT INTO collection_snapshot (env_id, filename, context_hash, test_names, "
+                "recorded_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(env_id, filename, context_hash) DO UPDATE SET "
+                "test_names = excluded.test_names, recorded_at = excluded.recorded_at",
+                [
+                    (
+                        env_id,
+                        filename,
+                        context,
+                        json.dumps(sorted(set(names))),
+                        timestamp,
+                    )
+                    for filename, context, names in snapshots
+                ],
+            )
+
+        self._write(body)
+
+    # ---------------------------------------------------------------- reads (compat API)
+
+    def all_test_executions(self, exec_id):
+        """Newest observation per test: {test_name: {duration, failed, forced}}."""
+        rows = self._read(
+            """
+            SELECT test_name, duration, failed FROM (
+                SELECT test_name, duration, failed, ROW_NUMBER() OVER (
+                    PARTITION BY test_name ORDER BY last_seen_at DESC, id DESC) AS rn
+                FROM observation WHERE env_id = ?)
+            WHERE rn = 1
+            """,
+            (exec_id,),
+        )
+        return {
+            row["test_name"]: {
+                "duration": row["duration"],
+                "failed": row["failed"],
+                "forced": None,
+            }
+            for row in rows
+        }
+
+    def filenames(self, exec_id):
+        rows = self._read(
+            """
+            SELECT DISTINCT f.filename FROM dep_fp f
+            JOIN observation_dep od ON od.fp_id = f.id
+            JOIN observation o ON o.id = od.observation_id
+            WHERE o.env_id = ? ORDER BY f.filename
+            """,
+            (exec_id,),
+        )
+        return [row[0] for row in rows]
+
+    def all_filenames(self):
+        return [row[0] for row in self._read("SELECT DISTINCT filename FROM dep_fp")]
+
+    def observations_of(self, test_name, exec_id=None):
+        """Observations of one test (all environments unless exec_id), newest first."""
+        sql = (
+            "SELECT o.*, e.name AS env_name FROM observation o "
+            "JOIN environment e ON e.id = o.env_id WHERE o.test_name = ?"
+        )
+        params = [test_name]
+        if exec_id is not None:
+            sql += " AND o.env_id = ?"
+            params.append(exec_id)
+        return self._read(sql + " ORDER BY o.last_seen_at DESC, o.id DESC", params)
+
+    def observation_deps(self, observation_id):
+        return self._read(
+            "SELECT f.id, f.filename, f.checksums FROM observation_dep od "
+            "JOIN dep_fp f ON f.id = od.fp_id WHERE od.observation_id = ? ORDER BY f.filename",
+            (observation_id,),
+        )
+
+    # ---------------------------------------------------------------- session end / stats
+
+    def finish_execution(self, exec_id=None, duration=None, select=True):  # pylint: disable=unused-argument
+        """Upstream entry point: opportunistic maintenance at the end of a session."""
+        self.maybe_gc()
+
+    def fetch_saving_totals(self, select):
+        prefix = "" if select else "potential_"
+        return tuple(
+            self.fetch_attribute(attribute=f"{prefix}{name}", default=0)
+            for name in ("time_saved", "time_all", "tests_saved", "tests_all")
+        )
+
+    # ---------------------------------------------------------------- maintenance
+
+    def maybe_gc(self, interval_hours=DEFAULT_GC_INTERVAL_HOURS, **policy):
+        """Run gc() if nobody did in the last interval_hours; returns its stats or None."""
+        key = "None:last_gc_at"
+
+        def claim(con):
+            row = con.execute(
+                "SELECT value FROM metadata WHERE key = ?", (key,)
+            ).fetchone()
+            timestamp = now()
+            if (
+                row
+                and row[0] is not None
+                and float(row[0]) > timestamp - interval_hours * 3600
+            ):
+                return False
+            con.execute(
+                "INSERT INTO metadata (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, timestamp),
+            )
+            return True
+
+        if not self._write(claim):
+            return None
+        return self.gc(**policy)
+
+    def _delete_chunked(self, select_ids_sql, delete_table, params=()):
+        deleted = 0
+        while True:
+
+            def body(con):
+                ids = [
+                    row[0]
+                    for row in con.execute(f"{select_ids_sql} LIMIT {GC_CHUNK}", params)
+                ]
+                if ids:
+                    con.executemany(
+                        f"DELETE FROM {delete_table} WHERE id = ?", [(i,) for i in ids]
+                    )
+                return len(ids)
+
+            count = self._write(body)
+            deleted += count
+            if count < GC_CHUNK:
+                return deleted
+
+    def gc(
+        self,
+        retention_days=DEFAULT_RETENTION_DAYS,
+        max_versions=DEFAULT_MAX_VERSIONS,
+        aggressive=False,
+    ):
+        """Bounded-growth cleanup in short chunked transactions. Never touches recent data."""
+        timestamp = now()
+        cutoff = timestamp - retention_days * DAY
+        stats = {}
+        stats["expired_observations"] = self._delete_chunked(
+            "SELECT id FROM observation WHERE max(last_seen_at, last_used_at) < ?",
+            "observation",
+            (cutoff,),
+        )
+        stats["superseded_observations"] = self._delete_chunked(
+            "SELECT id FROM observation WHERE superseded = 1 AND last_seen_at < ?",
+            "observation",
+            (timestamp - (0 if aggressive else SUPERSEDED_RETENTION_DAYS) * DAY,),
+        )
+        stats["excess_versions"] = self._delete_chunked(
+            "SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY env_id, test_name "
+            "ORDER BY max(last_seen_at, last_used_at) DESC, id DESC) AS rn FROM observation) "
+            "WHERE rn > ?",
+            "observation",
+            (max_versions,),
+        )
+        stats["orphan_fingerprints"] = self._delete_chunked(
+            "SELECT id FROM dep_fp f WHERE NOT EXISTS "
+            "(SELECT 1 FROM observation_dep od WHERE od.fp_id = f.id)",
+            "dep_fp",
+        )
+
+        def small_tables(con):
+            result = {}
+            result["memo_rows"] = con.execute(
+                "DELETE FROM fp_match WHERE checked_at < ?",
+                (timestamp - (0 if aggressive else MEMO_RETENTION_DAYS) * DAY,),
+            ).rowcount
+            result["snapshots"] = con.execute(
+                "DELETE FROM collection_snapshot WHERE recorded_at < ? OR "
+                "(env_id, filename, context_hash) IN ("
+                " SELECT env_id, filename, context_hash FROM (SELECT env_id, filename, "
+                " context_hash, ROW_NUMBER() OVER (PARTITION BY env_id, filename "
+                " ORDER BY recorded_at DESC) AS rn FROM collection_snapshot) WHERE rn > ?)",
+                (cutoff, SNAPSHOTS_PER_FILE),
+            ).rowcount
+            result["environments"] = con.execute(
+                "DELETE FROM environment WHERE last_used_at < ? AND NOT EXISTS "
+                "(SELECT 1 FROM observation o WHERE o.env_id = environment.id)",
+                (cutoff,),
+            ).rowcount
+            result["sessions"] = con.execute(
+                "DELETE FROM session WHERE started_at < ?",
+                (timestamp - SESSION_RETENTION_DAYS * DAY,),
+            ).rowcount
+            return result
+
+        stats.update(self._write(small_tables))
+        try:
+            stats["interrupted_sessions"] = self.mark_stale_sessions()
+        except DbError:
+            pass
+        try:
+            self.con.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            self.con.execute("PRAGMA incremental_vacuum(2000)")
+            self.con.execute("PRAGMA optimize")
+        except sqlite3.Error:
+            pass  # maintenance only
+        return stats
+
+    def checkpoint(self, mode="TRUNCATE"):
+        return tuple(self.con.execute(f"PRAGMA wal_checkpoint({mode})").fetchone())
+
+    def integrity_check(self):
+        return [row[0] for row in self._read("PRAGMA integrity_check")]
+
+    def backup(self, dest_path):
+        """Consistent online copy (sqlite backup API) to dest_path (private permissions)."""
+        dest = sqlite3.connect(dest_path)
+        try:
+            self.con.backup(dest)
+        finally:
+            dest.close()
+        if os.name == "posix":
+            os.chmod(dest_path, 0o600)
+
+    def restore_from(self, src_path):
+        """Replace this database's content with src_path's (writers wait on the lock)."""
+        src = sqlite3.connect(f"file:{os.path.abspath(src_path)}?mode=ro", uri=True)
+        try:
+            src.backup(self.con)
+        finally:
+            src.close()
+
+    def table_counts(self):
+        return {
+            table: self._read(f"SELECT count(*) FROM {table}")[0][0]
+            for table in (
+                "environment",
+                "observation",
+                "observation_dep",
+                "dep_fp",
+                "fp_match",
+                "collection_snapshot",
+                "session",
+            )
         }

@@ -4,10 +4,9 @@ import random
 import sys
 import sysconfig
 import textwrap
+import time
 from functools import lru_cache
 from collections import defaultdict
-from xmlrpc.client import Fault, ProtocolError, ServerProxy
-from socket import gaierror
 
 from typing import TypeVar
 
@@ -20,6 +19,7 @@ from coverage import Coverage, CoverageData
 from coverage.exceptions import CoverageException
 
 from testmon import db
+from testmon import selection
 from testmon import TESTMON_VERSION as TM_CLIENT_VERSION
 from testmon.common import (
     get_logger,
@@ -27,12 +27,15 @@ from testmon.common import (
     drop_patch_version,
     git_current_head,
 )
+from testmon.config import resolve_db_location
 
 from testmon.process_code import (
     match_fingerprint,
     create_fingerprint,
-    methods_to_checksums,
+    methods_to_checksums,  # noqa: F401  (re-exported for tests)
+    get_files_shas,
     get_source_sha,
+    read_source_sha,
     Module,
 )
 
@@ -83,17 +86,30 @@ class SourceTree:
 
     def get_file(self, filename):
         if filename not in self.cache:
-            code, fsha = get_source_sha(directory=self.rootdir, filename=filename)
+            if filename.startswith(selection.ABS_PREFIX):
+                path = selection.strip_abs(filename)
+                code, fsha = read_source_sha(path)
+                directory, name = "", path
+            else:
+                path = os.path.join(self.rootdir, filename)
+                if filename not in get_files_shas(self.rootdir) and not os.path.exists(
+                    path
+                ):
+                    self.cache[filename] = None
+                    return None
+                code, fsha = get_source_sha(directory=self.rootdir, filename=filename)
+                directory, name = self.rootdir, filename
             if fsha:
+                base = os.path.basename(name)
                 try:
-                    fs_mtime = os.path.getmtime(os.path.join(self.rootdir, filename))
+                    fs_mtime = os.path.getmtime(path)
                     self.cache[filename] = Module(
                         source_code=code,
                         mtime=fs_mtime,
-                        ext=filename.rsplit(".", 1)[1],
+                        ext=base.rsplit(".", 1)[1] if "." in base else "",
                         fs_fsha=fsha,
-                        filename=filename,
-                        rootdir=self.rootdir,
+                        filename=name,
+                        rootdir=directory,
                     )
                 except FileNotFoundError:
                     self.cache[filename] = None
@@ -120,9 +136,7 @@ def check_fsha(file_system, record):
     return record["fsha"] == fs_fsha
 
 
-def check_fingerprint(
-    disk, record: db.ChangedFileData
-):  # filename name method_fshas id failed
+def check_fingerprint(disk, record):  # filename name method_fshas id failed
     file = record[0]
     fingerprint = record[2]
 
@@ -154,7 +168,14 @@ def collect_mhashes(source_tree, new_changed_file_data):
     return files_mhashes
 
 
-class TestmonData:  # pylint: disable=too-many-instance-attributes
+class TestmonData:  # pylint: disable=too-many-instance-attributes,too-many-public-methods
+    """The plugin's view of the database for one pytest process.
+
+    Selection state (stable/unstable tests, deselectable tests and files) comes from
+    testmon.selection; observations are written through testmon.db. On an xdist worker the
+    controller's selection arrives through workerinput and no database is opened.
+    """
+
     __test__ = False
 
     def __init__(
@@ -162,16 +183,26 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         rootdir,
         database=None,
         readonly=False,
+        db_location=None,
+        timeout=db.DEFAULT_TIMEOUT,
+        open_db=True,
     ):
         self.rootdir = rootdir
         self.source_tree = SourceTree(rootdir=self.rootdir)
-
-        if database:
+        get_files_shas.cache_clear()  # a long-lived process may run several sessions
+        self.db_location = None
+        if database is not None:
             self.db = database  # pylint: disable=invalid-name
+        elif not open_db:
+            self.db = None
         else:
+            self.db_location = db_location or resolve_db_location(rootdir)
             self.db = db.DB(
-                os.path.join(self.rootdir, get_data_file_path()), readonly=readonly
-            )  # pylint: disable=invalid-name
+                self.db_location.path,
+                readonly=readonly,
+                shared=self.db_location.shared,
+                timeout=timeout,
+            )
 
         # Initialize instance variables (will be set by init methods)
         self.environment = None
@@ -184,18 +215,47 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.stable_test_names = None
         self.stable_files = None
         self.failing_tests = None
+        self.selection: selection.SelectionResult = None
+        self.deselected_tests = set()
+        self.deselected_files = set()
+        self.ignorable_files = {}
+        self._durations = None
+        self.session_id = None
+        self.dropped_batches = 0
+        self.write_time = 0.0
+        self.gc_time = 0.0
+        self.warnings = []
+        self.run_info = {"selected": None, "deselected": [], "ignored_files": []}
+        self.run_stats = None
+
+    # ------------------------------------------------------------------ construction
 
     @classmethod
-    def for_local_run(
+    def for_local_run(  # pylint: disable=too-many-arguments
         cls,
         rootdir,
         database=None,
         environment=None,
         system_packages=None,
         python_version=None,
+        project="",
+        db_location=None,
+        timeout=db.DEFAULT_TIMEOUT,
     ):
-        instance = cls(rootdir, database=database, readonly=False)
-        instance._init_for_local_run(environment, system_packages, python_version)
+        instance = cls(
+            rootdir,
+            database=database,
+            readonly=False,
+            db_location=db_location,
+            timeout=timeout,
+        )
+        try:
+            instance._init_for_local_run(
+                environment, system_packages, python_version, project
+            )
+        except BaseException:
+            instance.close_connection()
+            raise
         return instance
 
     def _init_for_local_run(
@@ -203,6 +263,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         environment=None,
         system_packages=None,
         python_version=None,
+        project="",
     ):
         """Internal method to initialize for local run."""
         self.environment = environment if environment else "default"
@@ -214,31 +275,13 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         if not python_version:
             python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
-        # Initiate execution (controller or single process)
-        try:
-            result = self.db.initiate_execution(
-                self.environment,
-                system_packages,
-                python_version,
-                {
-                    "tm_client_version": TM_CLIENT_VERSION,
-                    "git_head_sha": git_current_head(),
-                    "ci": os.environ.get("CI"),
-                },
-            )
-        except (ConnectionRefusedError, Fault, ProtocolError, gaierror) as exc:
-            logger.error(
-                (
-                    "%s error when communication with testmon.net. (falling back to"
-                    " .testmondata locally)"
-                ),
-                exc,
-            )
-            self.db = db.DB(os.path.join(self.rootdir, get_data_file_path()))  # pylint: disable=invalid-name
-            result = self.db.initiate_execution(
-                self.environment, system_packages, python_version, {}
-            )
-
+        result = self.db.initiate_execution(
+            self.environment,
+            system_packages,
+            python_version,
+            {"tm_client_version": TM_CLIENT_VERSION, "ci": os.environ.get("CI")},
+            project=project or "",
+        )
         self.exec_id = result["exec_id"]
         self.system_packages_change = result["packages_changed"]
         self.files_of_interest = result["filenames"]
@@ -252,8 +295,16 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         system_packages_change=None,
         files_of_interest=None,
         environment=None,
+        selection_payload=None,
+        db_location=None,
     ):
-        instance = cls(rootdir, database=database, readonly=True)
+        if selection_payload is not None:
+            instance = cls(rootdir, database=database, open_db=False)
+            instance.apply_selection_payload(selection_payload)
+        else:
+            instance = cls(
+                rootdir, database=database, readonly=True, db_location=db_location
+            )
         instance._init_for_worker(
             exec_id, system_packages_change, files_of_interest, environment
         )
@@ -275,24 +326,43 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         elif not hasattr(self, "environment") or self.environment is None:
             self.environment = "default"
 
+    # ------------------------------------------------------------------ xdist transfer
+
+    def selection_payload(self):
+        """What a worker needs to make the controller's selection, as plain data."""
+        return {
+            "deselected_tests": sorted(self.deselected_tests),
+            "deselected_files": sorted(self.deselected_files),
+            "durations": dict(self._durations or {}),
+            "stable_test_names": sorted(self.stable_test_names or ()),
+        }
+
+    def apply_selection_payload(self, payload):
+        self.deselected_tests = set(payload["deselected_tests"])
+        self.deselected_files = set(payload["deselected_files"])
+        self._durations = dict(payload["durations"])
+        self.stable_test_names = set(payload.get("stable_test_names", ()))
+        self.unstable_test_names = set()
+        self.failing_tests = []
+        self.all_files = set()
+        self.stable_files = set()
+        self.unstable_files = set()
+
+    # ------------------------------------------------------------------ connection
+
     @property
     def new_db(self):
-        # Only local DB instances have file_created attribute
         if isinstance(self.db, db.DB):
             return self.db.file_created
         return False
 
     def close_connection(self):
-        """Release the storage: the sqlite connection, or the transport of a tmnet proxy.
+        """Release the sqlite connection. Idempotent.
 
-        Idempotent. Tests that inspect the data after a run reopen it (see tests/lib4tests.py).
+        Tests that inspect the data after a run reopen it (see tests/lib4tests.py).
         """
         database, self.db = self.db, None
-        if database is None:
-            return
-        if isinstance(database, ServerProxy):
-            database("close")()  # attribute access would be a remote call
-        else:
+        if database is not None:
             database.close()
 
     def __enter__(self):
@@ -301,121 +371,242 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
     def __exit__(self, *args):
         self.close_connection()
 
+    def warn(self, message):
+        if message not in self.warnings:
+            self.warnings.append(message)
+            logger.warning(message)
+
+    # ------------------------------------------------------------------ queries
+
     @property
     def all_tests(self):
+        if self.db is None:
+            return {}
         return self.db.all_test_executions(self.exec_id)
 
+    @property
+    def avg_durations(self) -> dict:
+        if self._durations is not None:
+            durations_by_test = self._durations
+        else:
+            durations_by_test = {
+                name: (report or {}).get("duration")
+                for name, report in self.all_tests.items()
+            }
+        stats = defaultdict(lambda: {"test_execution": 0, "sum_duration": 0})
+        for test_execution_id, duration in durations_by_test.items():
+            class_name = get_test_execution_class_name(test_execution_id)
+            module_name = get_test_execution_module_name(test_execution_id)
+
+            stats[test_execution_id]["test_execution"] += 1
+            stats[test_execution_id]["sum_duration"] = duration or 0
+            if class_name:
+                stats[class_name]["test_execution"] += 1
+                stats[class_name]["sum_duration"] += stats[test_execution_id][
+                    "sum_duration"
+                ]
+            stats[module_name]["test_execution"] += 1
+            stats[module_name]["sum_duration"] += stats[test_execution_id][
+                "sum_duration"
+            ]
+
+        durations = defaultdict(lambda: 0)
+        for key, stat in stats.items():
+            durations[key] = stat["sum_duration"] / stat["test_execution"]
+
+        return durations
+
+    # ------------------------------------------------------------------ selection
+
+    def determine_stable(self, context_files=(), use_snapshots=True):
+        result = selection.compute_selection(
+            self.db,
+            self.exec_id,
+            self.source_tree,
+            context_files=context_files,
+            use_snapshots=use_snapshots,
+        )
+        self.apply_selection(result)
+        try:
+            self.db.record_selection_side_effects(
+                result.new_memo, result.used_observation_ids
+            )
+        except db.DbError as exc:
+            self.warn(f"testmon: could not store selection cache ({exc})")
+
+    def apply_selection(self, result: selection.SelectionResult):
+        self.selection = result
+        self.files_of_interest = result.filenames
+        self.all_files = set(result.filenames)
+        self.unstable_test_names = result.unstable
+        self.failing_tests = sorted(result.failing)
+        self.stable_test_names = result.stable
+        self.unstable_files = {home_file(name) for name in self.unstable_test_names}
+        self.stable_files = set(self.all_files) - self.unstable_files
+        self.deselected_tests = result.deselectable
+        self.ignorable_files = result.ignorable_files
+        self.deselected_files = set(result.ignorable_files)
+        self._durations = dict(result.durations)
+
+    # ------------------------------------------------------------------ recording
+
     def get_tests_fingerprints(self, nodes_files_lines, reports) -> TestExecutions:
+        """Observations of the tests in nodes_files_lines.
+
+        A test is left out (it will simply run again next time) when one of the files it
+        executed is gone or changed while the session ran: its observation would be
+        incomplete or would pair a fingerprint with the wrong content.
+        """
         test_executions_fingerprints = {}
         for context in nodes_files_lines:
-            deps_n_outcomes: DepsNOutcomes = {"deps": []}
-
+            deps = []
+            complete = True
             for filename, covered in nodes_files_lines[context].items():
-                if os.path.exists(os.path.join(self.rootdir, filename)):
-                    module = self.source_tree.get_file(filename)
-                    fingerprint = create_fingerprint(module, covered)
-                    deps_n_outcomes["deps"].append(
-                        {
-                            "filename": filename,
-                            "mtime": module.mtime,
-                            "fsha": module.fs_fsha,
-                            "method_checksums": fingerprint,
-                        }
-                    )
+                if filename.startswith(selection.ABS_PREFIX):
+                    path = selection.strip_abs(filename)
+                else:
+                    path = os.path.join(self.rootdir, filename)
+                module = (
+                    self.source_tree.get_file(filename)
+                    if os.path.exists(path)
+                    else None
+                )
+                if module is None:
+                    complete = False
+                    break
+                fingerprint = create_fingerprint(module, covered)
+                if not module.consistent:
+                    complete = False
+                    break
+                deps.append(
+                    {
+                        "filename": filename,
+                        "fsha": module.fs_fsha,
+                        "method_checksums": fingerprint,
+                    }
+                )
+            if not complete or not deps:
+                self.warn(
+                    "testmon: some files changed or disappeared while tests ran; "
+                    "the affected tests were not recorded and will run again"
+                )
+                continue
 
+            deps_n_outcomes: DepsNOutcomes = {"deps": deps}
             deps_n_outcomes.update(process_result(reports[context]))
-            deps_n_outcomes["forced"] = context in self.stable_test_names and (
-                context not in self.failing_tests
+            deps_n_outcomes["forced"] = context in (self.stable_test_names or ()) and (
+                context not in (self.failing_tests or ())
             )
             test_executions_fingerprints[context] = deps_n_outcomes
         return test_executions_fingerprints
 
-    def sync_db_fs_tests(self, retain):
-        collected = retain.union(set(self.stable_test_names))
-        add = list(collected - set(self.all_tests))
-        test_execution_file_fps = {
-            test_name: {
-                "deps": (
-                    {
-                        "filename": home_file(test_name),
-                        "method_checksums": methods_to_checksums(["0match"]),
-                        "mtime": None,
-                        "fsha": None,
-                    },
-                )
-            }
-            for test_name in add
-            if is_python_file(home_file(test_name))
-        }
-        if test_execution_file_fps:
-            self.save_test_execution_file_fps(test_execution_file_fps)
-
-        to_delete = list(set(self.all_tests) - collected)
-        self.db.delete_test_executions(to_delete, self.exec_id)
-
-    def determine_stable(self):
-        files_fshas = {}
-        for filename in self.files_of_interest:
-            module = self.source_tree.get_file(filename)
-            if module:
-                files_fshas[filename] = module.fs_fsha
-
-        # Compare the fshas from disk to the fshas in the database and get files
-        # where the fsha is not in database.
-        new_changed_file_data = self.db.fetch_unknown_files(files_fshas, self.exec_id)
-
-        # Get the mhashes for the files from above
-        files_mhashes = collect_mhashes(self.source_tree, new_changed_file_data)
-
-        tests = self.db.determine_tests(self.exec_id, files_mhashes)
-        affected_tests, self.failing_tests = tests["affected"], tests["failing"]
-
-        self.all_files = set(self.db.filenames(self.exec_id))
-        self.unstable_test_names = set()
-        self.unstable_files = set()
-
-        for fingerprint_miss in affected_tests:
-            self.unstable_test_names.add(fingerprint_miss)
-            self.unstable_files.add(fingerprint_miss.split("::", 1)[0])
-
-        self.stable_test_names = set(self.all_tests) - self.unstable_test_names
-        self.stable_files = set(self.all_files) - self.unstable_files
-
-    @property
-    def avg_durations(self) -> dict:
-        stats = defaultdict(lambda: {"test_execution": 0, "sum_duration": 0})
-
-        for (
-            test_execution_id,
-            report,
-        ) in self.all_tests.items():  # pylint: disable=no-member
-            if report:
-                class_name = get_test_execution_class_name(test_execution_id)
-                module_name = get_test_execution_module_name(test_execution_id)
-
-                stats[test_execution_id]["test_execution"] += 1
-                stats[test_execution_id]["sum_duration"] = report.get("duration") or 0
-                if class_name:
-                    stats[class_name]["test_execution"] += 1
-                    stats[class_name]["sum_duration"] += stats[test_execution_id][
-                        "sum_duration"
-                    ]
-                stats[module_name]["test_execution"] += 1
-                stats[module_name]["sum_duration"] += stats[test_execution_id][
-                    "sum_duration"
-                ]
-
-        durations = defaultdict(lambda: 0)
-        for key, stats in stats.items():
-            durations[key] = stats["sum_duration"] / stats["test_execution"]
-
-        return durations
-
     def save_test_execution_file_fps(self, test_executions_fingerprints):
-        self.db.insert_test_file_fps(test_executions_fingerprints, self.exec_id)
+        """Store one batch; a database failure loses the batch, never the test results."""
+        if not test_executions_fingerprints:
+            return
+        start = time.perf_counter()
+        try:
+            self.db.insert_test_file_fps(
+                test_executions_fingerprints,
+                self.exec_id,
+                supersede=self.selection.valid_failing if self.selection else None,
+            )
+        except db.DbError as exc:
+            self.dropped_batches += 1
+            self.warn(
+                f"testmon: could not store dependency data ({exc}); "
+                "the affected tests will run again next time"
+            )
+        finally:
+            self.write_time += time.perf_counter() - start
+
+    def record_collection(self, nodeids, context_files=()):
+        """Remember which tests each collected test file produced (for file-level skipping)."""
+        by_file = defaultdict(set)
+        for nodeid in nodeids:
+            by_file[home_file(nodeid)].add(nodeid)
+        snapshots = []
+        for filename, names in by_file.items():
+            if not is_python_file(filename):
+                continue
+            ctx = selection.context_hash(self.source_tree, filename, context_files)
+            if ctx:
+                snapshots.append((filename, ctx, sorted(names)))
+        try:
+            self.db.record_collection_snapshots(self.exec_id, snapshots)
+        except db.DbError as exc:
+            self.warn(f"testmon: could not store the collection snapshot ({exc})")
+
+    def sync_db_fs_tests(self, retain, context_files=()):
+        """Upstream name. Nothing is deleted any more: other branches' tests stay."""
+        self.record_collection(retain, context_files)
+
+    # ------------------------------------------------------------------ session
+
+    def begin_session(self, select, collect):
+        try:
+            self.session_id = self.db.start_session(
+                self.exec_id,
+                select,
+                collect,
+                rootdir_hash=hashlib.sha256(
+                    os.path.realpath(self.rootdir or ".").encode()
+                ).hexdigest()[:16],
+                git_head=git_current_head(self.rootdir or None),
+            )
+        except db.DbError as exc:
+            self.warn(f"testmon: could not record the session ({exc})")
+
+    def finish_session(self, stats, select, status="finished", gc_policy=None):
+        """Store run statistics and do opportunistic maintenance; failures only warn."""
+        self.run_stats = stats
+        prefix = "" if select else "potential_"
+        try:
+            self.db.increment_attributes(
+                {
+                    f"{prefix}time_saved": stats["saved_time"],
+                    f"{prefix}time_all": stats["all_time"],
+                    f"{prefix}tests_saved": stats["n_saved"],
+                    f"{prefix}tests_all": stats["n_all"],
+                },
+                exec_id=None,
+            )
+            if self.session_id:
+                self.db.finish_session(
+                    self.session_id,
+                    status=status,
+                    n_collected=stats["n_all"],
+                    n_selected=stats["n_selected"],
+                    n_deselected=stats["n_deselected"],
+                    saved_time=stats["saved_time"],
+                    all_time=stats["all_time"],
+                    dropped_batches=self.dropped_batches,
+                )
+        except db.DbError as exc:
+            self.warn(f"testmon: could not store run statistics ({exc})")
+        start = time.perf_counter()
+        try:
+            self.db.maybe_gc(**(gc_policy or {}))
+        except db.DbError as exc:
+            self.warn(f"testmon: database cleanup failed ({exc})")
+        finally:
+            self.gc_time = time.perf_counter() - start
 
     def fetch_saving_stats(self, select):
-        return self.db.fetch_saving_stats(self.exec_id, select)
+        stats = self.run_stats or {
+            "saved_time": 0,
+            "all_time": 0,
+            "n_saved": 0,
+            "n_all": 0,
+        }
+        totals = self.db.fetch_saving_totals(select)
+        return (
+            stats["saved_time"],
+            stats["all_time"],
+            stats["n_saved"],
+            stats["n_all"],
+            *totals,
+        )
 
 
 def get_new_mtimes(filesystem, hits):
@@ -445,6 +636,12 @@ def get_test_execution_module_name(node_id):
 @lru_cache(1000)
 def cached_relpath(path, basepath):
     return os.path.relpath(path, basepath).replace(os.sep, "/")
+
+
+@lru_cache(4000)
+def cached_dep_name(path, real_rootdir):
+    """Dependency name of a measured file (coverage reports realpaths)."""
+    return selection.realpath_relative(path, real_rootdir)
 
 
 # coverage 7.10+ defaults to the sys.monitoring core on CPython 3.14+. That core
@@ -480,6 +677,7 @@ class TestmonCollector:
         if testmon_labels is None:
             testmon_labels = {"singleprocess"}
         self.rootdir = rootdir
+        self.real_rootdir = os.path.realpath(rootdir)
         self.testmon_labels = testmon_labels
         self.cov: Coverage = None
         self.sub_cov_file = None
@@ -614,7 +812,7 @@ class TestmonCollector:
         nodes_files_lines = {}
         files_lines = {}
         for file in files:
-            relfilename = cached_relpath(file, self.rootdir)
+            relfilename = cached_dep_name(file, self.real_rootdir)
 
             contexts_by_lineno = cov_data.contexts_by_lineno(file)
 

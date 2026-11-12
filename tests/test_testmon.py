@@ -36,6 +36,7 @@ from tests.lib4tests import GetTestmonDataPlugin, LocalRemote  # noqa: F401
 # use the fixture here
 
 from testmon.common import get_system_packages
+from testmon.report import load_report
 
 pytest_plugins = ("pytester",)
 
@@ -2207,7 +2208,19 @@ class TestmonCollect:
             "--testmon",
         )
         td = local_remote.td
-        assert set(td.db.filenames(td.exec_id)) == {"test_a.py"}
+        # multi-version: the newest observation of test_1 depends on test_a.py only; the
+        # earlier one (which used lib.py) is kept for checkouts where it is still valid
+        observations = td.db.observations_of("test_a.py::test_1", td.exec_id)
+        assert len(observations) == 2
+        newest_deps = {
+            row["filename"] for row in td.db.observation_deps(observations[0]["id"])
+        }
+        older_deps = {
+            row["filename"] for row in td.db.observation_deps(observations[1]["id"])
+        }
+        assert newest_deps == {"test_a.py"}
+        assert older_deps == {"test_a.py", "lib.py"}
+        assert set(td.db.filenames(td.exec_id)) == {"test_a.py", "lib.py"}
 
     def test_pytest_k_deselect(self, local_remote):
         if local_remote.name == "xdist":
@@ -2867,9 +2880,9 @@ class TestPlusCov:
         with CoreTestmonData("") as td:
             result.stdout.fnmatch_lines(["*test_a.py       4      0   100%*"])
             checksums = blob_to_checksums(
-                td.db.con.execute("select method_checksums from file_fp").fetchone()[
-                    "method_checksums"
-                ]
+                td.db.con.execute(
+                    "select checksums AS method_checksums from dep_fp"
+                ).fetchone()["method_checksums"]
             )
             assert create_fingerprint_source("print(1928)", {1})[0] in checksums
 
@@ -2903,9 +2916,9 @@ class TestPlusCov:
         result.stdout.fnmatch_lines(["TOTAL           1      0   100%"])
         with CoreTestmonData("") as td:
             checksums = blob_to_checksums(
-                td.db.con.execute("select method_checksums from file_fp").fetchone()[
-                    "method_checksums"
-                ]
+                td.db.con.execute(
+                    "select checksums AS method_checksums from dep_fp"
+                ).fetchone()["method_checksums"]
             )
             assert create_fingerprint_source("print(1928)", {1})[0] in checksums
 
@@ -2936,9 +2949,9 @@ class TestPlusCov:
 
         with CoreTestmonData("") as td:
             checksums = blob_to_checksums(
-                td.db.con.execute("select method_checksums from file_fp").fetchone()[
-                    "method_checksums"
-                ]
+                td.db.con.execute(
+                    "select checksums AS method_checksums from dep_fp"
+                ).fetchone()["method_checksums"]
             )
             assert create_fingerprint_source("print(1928)", {1})[0] in checksums
 
@@ -3019,6 +3032,8 @@ class TestXdist(object):
 
 
 class TestForcedFlag(object):
+    """Ported from the upstream `forced` column (removed): which tests ran and why."""
+
     def test_fresh_run(self, testdir):
         testdir.makepyfile(
             test_a="""
@@ -3029,14 +3044,20 @@ class TestForcedFlag(object):
                 assert 1==1
             """
         )
-        testdir.runpytest_inprocess("--testmon")
+        testdir.runpytest_inprocess("--testmon", "--testmon-report", "report.json")
+        report = load_report(str(testdir.tmpdir / "report.json"))
+        assert report["counts"]["selected"] == 2
+        assert {t["reason"] for t in report["tests"].values()} == {"no_observation"}
         with CoreTestmonData("") as testmon_data:
             assert (
                 2
                 == testmon_data.db.con.execute(
-                    "SELECT count(*) FROM test_execution WHERE forced IS NOT NULL"
+                    "SELECT count(*) FROM observation"
                 ).fetchone()[0]
             )
+            assert testmon_data.db.con.execute(
+                "SELECT n_selected, n_deselected FROM session"
+            ).fetchone()[:] == (2, 0)
 
     def test_one_changed(self, testdir):
         testdir.makepyfile(
@@ -3058,26 +3079,25 @@ class TestForcedFlag(object):
                 assert 2==2
             """
         )
-        testdir.runpytest_inprocess("--testmon")
+        testdir.runpytest_inprocess("--testmon", "--testmon-report", "report.json")
+        report = load_report(str(testdir.tmpdir / "report.json"))
+        tests = report["tests"]
+        # one test not run (upstream: forced IS NULL) ...
+        assert tests["test_a.py::test_1"]["decision"] == "deselected"
+        assert tests["test_a.py::test_1"]["reason"] == "deselect"
+        # ... one run because its dependencies changed (upstream: forced == 0) ...
+        assert tests["test_a.py::test_2"]["decision"] == "selected"
+        assert tests["test_a.py::test_2"]["reason"] == "all_invalid"
+        assert tests["test_a.py::test_2"]["invalid_dep"] == {
+            "filename": "test_a.py",
+            "cause": "mismatch",
+        }
+        # ... and none run although deselectable (upstream: forced == 1)
+        assert not [t for t in tests.values() if t["reason"] == "selector_forced"]
         with CoreTestmonData("") as testmon_data:
-            assert (
-                testmon_data.db.con.execute(
-                    "SELECT count(*) FROM test_execution WHERE forced IS NULL"
-                ).fetchone()[0]
-                == 1
-            )
-            assert (
-                testmon_data.db.con.execute(
-                    "SELECT count(*) FROM test_execution WHERE forced == 0"
-                ).fetchone()[0]
-                == 1
-            )
-            assert (
-                testmon_data.db.con.execute(
-                    "SELECT count(*) FROM test_execution WHERE forced == 1"
-                ).fetchone()[0]
-                == 0
-            )
+            assert testmon_data.db.con.execute(
+                "SELECT n_selected, n_deselected FROM session ORDER BY id DESC"
+            ).fetchone()[:] == (1, 1)
 
 
 class TestStats:

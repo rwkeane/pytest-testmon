@@ -3,9 +3,9 @@
 Main module of testmon pytest plugin.
 """
 
-import time
-import xmlrpc.client
 import os
+import sqlite3
+import time
 
 from collections import defaultdict
 from datetime import date, timedelta
@@ -29,7 +29,22 @@ from testmon.testmon_core import (
     cached_relpath,
 )
 from testmon import configure
-from testmon.common import get_logger, get_system_packages
+from testmon import db
+from testmon import report as tm_report
+from testmon.common import (
+    get_logger,
+    get_system_packages,
+    find_foreign_checkout_imports,
+)
+from testmon.config import (
+    FALLBACK_ERROR,
+    FALLBACK_POLICIES,
+    INI_OPTIONS,
+    REPORT_ENV,
+    number,
+    resolve_db_location,
+    resolve_fallback,
+)
 
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
@@ -116,9 +131,37 @@ def pytest_addoption(parser):
         "--tmnet",
         action="store_true",
         dest="tmnet",
+        help="Not supported by this fork (testmon.net cloud storage).",
+    )
+    group.addoption(
+        "--testmon-shared-db",
+        action="store",
+        dest="testmon_shared_db",
+        default=None,
+        metavar="PATH",
         help=(
-            "Use tmnet cloud for storage instead of .testmondata file used by --testmon (see https://www.testmon.net)."
+            "Use the shared database at PATH (overrides TESTMON_SHARED_DB and the "
+            "testmon_shared_db ini option)."
         ),
+    )
+    group.addoption(
+        "--testmon-db-fallback",
+        action="store",
+        dest="testmon_db_fallback",
+        default=None,
+        choices=FALLBACK_POLICIES,
+        help=(
+            "When the database can't be used: run-all (run every test, collect nothing; "
+            "the default) or error (exit before running tests)."
+        ),
+    )
+    group.addoption(
+        "--testmon-report",
+        action="store",
+        dest="testmon_report",
+        default=None,
+        metavar="PATH",
+        help="Write a JSON report of the selection decisions to PATH (or $TESTMON_REPORT).",
     )
 
     parser.addini("environment_expression", "environment expression", default="")
@@ -128,8 +171,13 @@ def pytest_addoption(parser):
         type="args",
         default=[],
     )
-    parser.addini("tmnet_url", "URL of the testmon.net api server.")
-    parser.addini("tmnet_api_key", "testmon api key")
+    parser.addini("tmnet_url", "URL of the testmon.net api server (unsupported).")
+    parser.addini("tmnet_api_key", "testmon api key (unsupported)")
+    for name, (help_text, ini_type, default) in INI_OPTIONS.items():
+        if ini_type:
+            parser.addini(name, help_text, type=ini_type, default=default)
+        else:
+            parser.addini(name, help_text, default=default)
 
 
 def testmon_options(config):
@@ -145,80 +193,107 @@ def testmon_options(config):
     return result
 
 
+def context_files(config):
+    """The pytest config file, when it lives in the rootdir: it influences collection."""
+    inipath = getattr(config, "inipath", None)
+    if not inipath:
+        return ()
+    rel = os.path.relpath(str(inipath), str(config.rootpath)).replace(os.sep, "/")
+    return () if rel.startswith("..") else (rel,)
+
+
+def snapshot_allowed(config):
+    """Collection is complete per file unless tests were picked individually or by --lf."""
+    file_or_dir = config.getoption("file_or_dir", None) or []
+    if any("::" in str(arg) for arg in file_or_dir):
+        return False
+    if getattr(config.option, "lf", False):
+        return False
+    return True
+
+
+def gc_policy(config):
+    return {
+        "interval_hours": number(
+            config.getini("testmon_gc_interval_hours"), db.DEFAULT_GC_INTERVAL_HOURS
+        ),
+        "retention_days": number(
+            config.getini("testmon_retention_days"), db.DEFAULT_RETENTION_DAYS
+        ),
+        "max_versions": number(
+            config.getini("testmon_max_versions"), db.DEFAULT_MAX_VERSIONS, int
+        ),
+    }
+
+
 def init_testmon_data(config: Config):
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
     )
-    ignore_dependencies = config.getini("testmon_ignore_dependencies")
-
-    system_packages = get_system_packages(ignore=ignore_dependencies)
-
-    url = config.getini("tmnet_url")
-    rpc_proxy = None
-
-    if config.testmon_config.tmnet or getattr(config, "tmnet", None):
-        rpc_proxy = getattr(config, "tmnet", None)
-
-        if not url:
-            url = "https://api1.testmon.net/"
-        if not rpc_proxy:
-            tmnet_api_key = config.getini("tmnet_api_key")
-            if "TMNET_API_KEY" in os.environ:
-                if tmnet_api_key:
-                    logger.warning(
-                        "Duplicate TMNET_API_KEY (environment and ini file). \
-                         Using TMNET_API_KEY from %s",
-                        config.inipath,
-                    )
-                else:
-                    tmnet_api_key = os.getenv("TMNET_API_KEY")
-
-            if not tmnet_api_key.strip():
-                raise ValueError(
-                    "TMNET_API_KEY is required when using --tmnet. "
-                    "Please set it in pytest.ini, pyproject.toml, or as an environment variable. "
-                )
-
-            rpc_proxy = xmlrpc.client.ServerProxy(
-                url,
-                allow_none=True,
-                headers=[("x-api-key", tmnet_api_key.strip())],
-            )
-
-    # Check if we're a worker and have exec_id from controller
+    rootdir = str(config.rootpath)
     running_as = get_running_as(config)
-    exec_id = None
-    system_packages_change = None
-    files_of_interest = None
+    timings = config.testmon_timings
 
     if running_as == "worker" and hasattr(config, "workerinput"):
-        # Use exec_id sent from controller
-        exec_id = config.workerinput.get("testmon_exec_id")
-        system_packages_change = config.workerinput.get(
-            "testmon_system_packages_change"
-        )
-        files_of_interest = config.workerinput.get("testmon_files_of_interest")
+        workerinput = config.workerinput
+        if workerinput.get("testmon_selection") is not None:
+            # the controller decided; the worker needs no database at all
+            config.testmon_data = TestmonData.for_worker(
+                rootdir=rootdir,
+                exec_id=workerinput.get("testmon_exec_id"),
+                system_packages_change=workerinput.get(
+                    "testmon_system_packages_change"
+                ),
+                environment=environment,
+                selection_payload=workerinput["testmon_selection"],
+            )
+            return
 
-    if running_as == "worker" and exec_id is not None:
-        # Initialize for xdist worker run
-        testmon_data: TestmonData = TestmonData.for_worker(
-            rootdir=str(config.rootpath),
-            exec_id=exec_id,
-            database=rpc_proxy,
-            system_packages_change=system_packages_change,
-            files_of_interest=files_of_interest,
+    location = resolve_db_location(
+        rootdir,
+        cli_value=config.getoption("testmon_shared_db"),
+        ini_value=config.getini("testmon_shared_db"),
+    )
+    config.testmon_db_location = location
+    timeout = number(config.getini("testmon_db_timeout"), db.DEFAULT_TIMEOUT)
+    use_snapshots = bool(config.getini("testmon_ignore_collect"))
+    start = time.perf_counter()
+    if running_as == "worker":
+        # no selection from the controller (e.g. testmon inactive there): decide locally
+        testmon_data = TestmonData.for_worker(
+            rootdir=rootdir,
+            exec_id=config.workerinput.get("testmon_exec_id"),
             environment=environment,
+            db_location=location,
         )
-    else:
-        # Initialize for local run (controller or single process)
-        testmon_data: TestmonData = TestmonData.for_local_run(
-            rootdir=str(config.rootpath),
-            database=rpc_proxy,
-            environment=environment,
-            system_packages=system_packages,
-        )
-    testmon_data.determine_stable()
+        config.testmon_data = testmon_data
+        if testmon_data.exec_id is None:
+            testmon_data._init_for_local_run(  # pylint: disable=protected-access
+                environment,
+                get_system_packages(
+                    ignore=config.getini("testmon_ignore_dependencies"), rootdir=rootdir
+                ),
+                None,
+                config.getini("testmon_project") or "",
+            )
+        testmon_data.determine_stable(context_files(config), use_snapshots)
+        return
+
+    ignore_dependencies = config.getini("testmon_ignore_dependencies")
+    system_packages = get_system_packages(ignore=ignore_dependencies, rootdir=rootdir)
+    testmon_data: TestmonData = TestmonData.for_local_run(
+        rootdir=rootdir,
+        environment=environment,
+        system_packages=system_packages,
+        project=config.getini("testmon_project") or "",
+        db_location=location,
+        timeout=timeout,
+    )
     config.testmon_data = testmon_data
+    timings["db_open"] = time.perf_counter() - start
+    testmon_data.determine_stable(context_files(config), use_snapshots)
+    tm_conf = config.testmon_config
+    testmon_data.begin_session(select=tm_conf.select, collect=tm_conf.collect)
 
 
 def get_running_as(config):
@@ -232,6 +307,7 @@ def get_running_as(config):
 
 
 def register_plugins(config, should_select, should_collect, cov_plugin):
+    running_as = get_running_as(config)
     if should_select or should_collect:
         config.pluginmanager.register(
             TestmonSelect(config, config.testmon_data), "TestmonSelect"
@@ -246,12 +322,53 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
                     cov_plugin=cov_plugin,
                 ),
                 config.testmon_data,
-                running_as=get_running_as(config),
+                running_as=running_as,
             ),
             "TestmonCollect",
         )
+    if (should_select or should_collect) and running_as != "worker":
+        config.pluginmanager.register(
+            TestmonSession(config, config.testmon_data), "TestmonSession"
+        )
     if (should_select or should_collect) and config.pluginmanager.hasplugin("xdist"):
-        config.pluginmanager.register(TestmonXdistSync(sync=should_collect))
+        config.pluginmanager.register(
+            TestmonXdistSync(sync=should_collect), "TestmonXdistSync"
+        )
+
+
+def fallback_message(error):
+    return (
+        f"testmon: database unavailable ({error.reason_code}: {error.detail}) "
+        "- running all tests, not collecting"
+    )
+
+
+def handle_db_failure(config, error: db.DbError):
+    """Apply the fallback policy: never let a database problem skip a test."""
+    testmon_data = getattr(config, "testmon_data", None)
+    if testmon_data is not None:
+        testmon_data.close_connection()
+    config.testmon_data = None
+    try:
+        policy = resolve_fallback(
+            config.getoption("testmon_db_fallback"),
+            config.getini("testmon_db_fallback"),
+        )
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+    config.testmon_fallback = {
+        "reason_code": error.reason_code,
+        "detail": error.detail,
+        "policy": policy,
+    }
+    if policy == FALLBACK_ERROR:
+        pytest.exit(
+            f"testmon: database unavailable ({error.reason_code}: {error.detail}); "
+            "not running tests (testmon_db_fallback = error)",
+            returncode=ExitCode.USAGE_ERROR,
+        )
+    config.testmon_config = TmConf(fallback_message(error), False, False)
+    logger.warning(fallback_message(error))
 
 
 def pytest_configure(config):
@@ -265,6 +382,16 @@ def pytest_configure(config):
     except ImportError:
         pass
 
+    config.testmon_fallback = None
+    config.testmon_timings = {}
+    config.testmon_db_location = None
+    if config.getoption("tmnet", False):
+        pytest.exit(
+            "--tmnet (testmon.net) is not supported by this fork of pytest-testmon; "
+            "use a shared SQLite database instead (testmon_shared_db, see docs/shared-db.md)",
+            returncode=ExitCode.USAGE_ERROR,
+        )
+
     cov_plugin = None
     cov_plugin = config.pluginmanager.get_plugin("_cov")
 
@@ -272,58 +399,91 @@ def pytest_configure(config):
         config, coverage_stack, cov_plugin=cov_plugin
     )
     config.testmon_config: TmConf = tm_conf
+    running_as = get_running_as(config)
+    report_path = config.getoption("testmon_report") or os.environ.get(REPORT_ENV)
+    if report_path and running_as != "worker" and tm_conf.message is not None:
+        config.pluginmanager.register(
+            TestmonReporter(config, report_path), "TestmonReporter"
+        )
     if tm_conf.select or tm_conf.collect:
         if config.pluginmanager.has_plugin(
             "TestmonSelect"
         ) or config.pluginmanager.has_plugin("TestmonCollect"):
             pytest.exit("You cannot use two instances of testmon plugin.")
+        if running_as != "worker":
+            foreign = find_foreign_checkout_imports(str(config.rootpath))
+            if foreign:
+                names = ", ".join(f"{name} -> {origin}" for name, origin in foreign)
+                message = (
+                    "testmon: deactivated because packages of this checkout are imported "
+                    f"from another checkout ({names}) - running all tests, not collecting"
+                )
+                logger.warning(message)
+                config.testmon_config = TmConf(message, False, False)
+                config.testmon_fallback = {
+                    "reason_code": "foreign_checkout",
+                    "detail": names,
+                    "policy": "run-all",
+                }
+                return
         try:
             init_testmon_data(config)
             register_plugins(config, tm_conf.select, tm_conf.collect, cov_plugin)
         except TestmonException as error:
             pytest.exit(str(error))
+        except db.DbError as error:
+            handle_db_failure(config, error)
+        except sqlite3.Error as error:
+            handle_db_failure(config, db.DbError.from_sqlite(error))
 
 
 def pytest_report_header(config):
     tm_conf = config.testmon_config
+    testmon_data = getattr(config, "testmon_data", None)
 
-    if tm_conf.collect or tm_conf.select:
-        unstable_files = getattr(config.testmon_data, "unstable_files", set())
-        stable_files = getattr(config.testmon_data, "stable_files", set())
-        environment = config.testmon_data.environment
+    if (tm_conf.collect or tm_conf.select) and testmon_data is not None:
+        unstable_files = getattr(testmon_data, "unstable_files", set())
+        stable_files = getattr(testmon_data, "stable_files", set())
+        environment = testmon_data.environment
 
         tm_conf.message += changed_message(
             config,
             environment,
-            config.testmon_data.system_packages_change,
+            testmon_data.system_packages_change,
             tm_conf.select,
             stable_files,
             unstable_files,
         )
+        location = getattr(config, "testmon_db_location", None)
+        if location is not None and location.shared:
+            reused = len(testmon_data.deselected_tests)
+            tm_conf.message += (
+                f"\ntestmon: shared db {location.path} "
+                f"(deselectable tests: {reused}, source: {location.source})"
+            )
+        if get_running_as(config) != "worker":
+            tm_conf.message += survey_notification(testmon_data)
+    return tm_conf.message
 
-        show_survey_notification = True
-        last_notification_date = config.testmon_data.db.fetch_attribute(
+
+def survey_notification(testmon_data):
+    try:
+        last_notification_date = testmon_data.db.fetch_attribute(
             "last_survey_notification_date"
         )
         if last_notification_date:
             last_notification_date = date.fromisoformat(last_notification_date)
             if date.today() - last_notification_date < SURVEY_NOTIFICATION_INTERVAL:
-                show_survey_notification = False
-            else:
-                config.testmon_data.db.write_attribute(
-                    "last_survey_notification_date", date.today().isoformat()
-                )
-        else:
-            config.testmon_data.db.write_attribute(
-                "last_survey_notification_date", date.today().isoformat()
-            )
-
-        if show_survey_notification:
-            tm_conf.message += (
-                "\nHelp shape testmon! Tell us what saves you time "
-                "and what we can improve: https://testmon.org/survey"
-            )
-    return tm_conf.message
+                return ""
+        testmon_data.db.write_attribute(
+            "last_survey_notification_date", date.today().isoformat()
+        )
+    except db.DbError:
+        return ""
+    return (
+        "\nHelp shape testmon! Tell us what saves you time "
+        "and what we can improve: https://testmon.org/survey"
+    )
 
 
 def changed_message(
@@ -336,7 +496,7 @@ def changed_message(
 ):
     message = ""
     if should_select:
-        changed_files_msg = ", ".join(unstable_files)
+        changed_files_msg = ", ".join(sorted(unstable_files))
         if changed_files_msg == "" or len(changed_files_msg) > 100:
             changed_files_msg = str(len(config.testmon_data.unstable_files))
 
@@ -355,8 +515,9 @@ def changed_message(
 
 
 def pytest_unconfigure(config):
-    if hasattr(config, "testmon_data"):
-        config.testmon_data.close_connection()
+    testmon_data = getattr(config, "testmon_data", None)
+    if testmon_data is not None:
+        testmon_data.close_connection()
 
 
 class TestmonCollect:
@@ -385,12 +546,15 @@ class TestmonCollect:
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_collection_modifyitems(self, session, config, items):  # pylint: disable=unused-argument
-        should_sync = not session.testsfailed and self._running_as in (
-            "single",
-            "controller",
-        )
-        if should_sync:
-            config.testmon_data.sync_db_fs_tests(retain=set(self.raw_test_names))
+        complete = not session.testsfailed and snapshot_allowed(config)
+        names = set(self.raw_test_names) | {item.nodeid for item in items}
+        if self._running_as == "worker":
+            workeroutput = getattr(config, "workeroutput", None)
+            if workeroutput is not None:
+                workeroutput["testmon_collected"] = sorted(names) if complete else None
+            return
+        if complete:
+            config.testmon_data.record_collection(names, context_files(config))
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(self, item, nextitem):  # pylint: disable=unused-argument
@@ -436,55 +600,102 @@ class TestmonCollect:
             self.testmon.close()
 
     def pytest_sessionfinish(self, session):  # pylint: disable=unused-argument
-        if self._running_as in ("single", "controller"):
-            self.testmon_data.db.finish_execution(
-                self.testmon_data.exec_id,
-                time.time() - self._sessionstarttime,
-                session.config.testmon_config.select,
-            )
         self.testmon.close()
+
+
+class TestmonSession:
+    """Run statistics, the session row and opportunistic maintenance (single/controller)."""
+
+    def __init__(self, config, testmon_data: TestmonData):
+        self.config = config
+        self.testmon_data = testmon_data
+        self.durations = defaultdict(float)
+        self.interrupted = False
+
+    @pytest.hookimpl
+    def pytest_runtest_logreport(self, report):
+        self.durations[report.nodeid] += report.duration or 0.0
+
+    def pytest_keyboard_interrupt(self, excinfo):  # pylint: disable=unused-argument
+        self.interrupted = True
+
+    def deselected_names(self):
+        run_info = self.testmon_data.run_info
+        names = set(run_info.get("deselected") or ())
+        for filename in run_info.get("ignored_files") or ():
+            names.update(self.testmon_data.ignorable_files.get(filename, ()))
+        return names
+
+    def pytest_sessionfinish(self, session, exitstatus):  # pylint: disable=unused-argument
+        select = self.config.testmon_config.select
+        recorded = self.testmon_data._durations or {}  # pylint: disable=protected-access
+        ran = set(self.durations)
+        if select:
+            saved = self.deselected_names() - ran
+        else:  # potential savings: tests that ran although they were deselectable
+            saved = set(self.testmon_data.deselected_tests) & ran
+        saved_time = sum(recorded.get(name) or 0 for name in saved)
+        run_time = sum(self.durations.values())
+        stats = {
+            "n_selected": len(ran),
+            "n_deselected": len(saved) if select else 0,
+            "n_saved": len(saved),
+            "n_all": len(ran | saved),
+            "saved_time": saved_time,
+            "all_time": run_time + (saved_time if select else 0),
+        }
+        interrupted = self.interrupted or exitstatus == ExitCode.INTERRUPTED
+        self.testmon_data.finish_session(
+            stats,
+            select,
+            status="interrupted" if interrupted else "finished",
+            gc_policy=gc_policy(self.config),
+        )
 
 
 class TestmonXdistSync:
     def __init__(self, sync=True):
-        self.await_nodes = 0
         self.sync = sync
+        self._collected_recorded = False
 
     def pytest_configure_node(self, node):
         """
-        Send exec_id and related data from controller to worker during xdist initialization.
-        This avoids each worker having to independently determine the environment and check
-        for package changes.
+        Send the controller's selection to the worker during xdist initialization.
+
+        Every worker must collect exactly the same tests; letting each worker query a shared
+        database that other agents keep writing to could make them disagree. The worker
+        then needs no database connection at all.
 
         Note: This hook is called on the controller side for each worker node.
         The node.config here is the controller's config, not the worker's config.
         """
-        # Verify we're on the controller (not a worker)
-        # node.config in this hook is the controller's config
         running_as = get_running_as(node.config)
         if running_as != "controller":
             return  # Safety check: only run on controller
 
-        # Count the node here, before it starts: counting it when it reports ready would let a
-        # fast worker's collection trigger sync_db_fs_tests while a slow one is still determining
-        # stability, which then sees the placeholder rows as stable tests and collects nothing.
-        self.await_nodes += 1
-
-        # Only proceed if testmon_data has been initialized and workerinput exists
-        if hasattr(node.config, "testmon_data") and hasattr(node, "workerinput"):
-            testmon_data: TestmonData = node.config.testmon_data
+        testmon_data = getattr(node.config, "testmon_data", None)
+        if testmon_data is not None and hasattr(node, "workerinput"):
             node.workerinput["testmon_exec_id"] = testmon_data.exec_id
             node.workerinput["testmon_system_packages_change"] = (
                 testmon_data.system_packages_change
             )
-            node.workerinput["testmon_files_of_interest"] = (
-                testmon_data.files_of_interest
-            )
+            node.workerinput["testmon_selection"] = testmon_data.selection_payload()
 
-    def pytest_xdist_node_collection_finished(self, node, ids):  # pylint: disable=invalid-name
-        self.await_nodes += -1
-        if self.await_nodes == 0 and self.sync:
-            node.config.testmon_data.sync_db_fs_tests(retain=set(ids))
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error):  # pylint: disable=unused-argument
+        testmon_data = getattr(node.config, "testmon_data", None)
+        workeroutput = getattr(node, "workeroutput", None) or {}
+        if testmon_data is None or self._collected_recorded:
+            return
+        if "testmon_deselected" not in workeroutput:
+            return
+        self._collected_recorded = True
+        run_info = testmon_data.run_info
+        run_info["deselected"] = workeroutput.get("testmon_deselected") or []
+        run_info["ignored_files"] = workeroutput.get("testmon_ignored_files") or []
+        collected = workeroutput.get("testmon_collected")
+        if self.sync and collected:
+            testmon_data.record_collection(collected, context_files(node.config))
 
 
 def did_fail(reports):
@@ -522,22 +733,18 @@ class TestmonSelect:
     def __init__(self, config, testmon_data: TestmonData):
         self.testmon_data: TestmonData = testmon_data
         self.config = config
-
-        failing_files, failing_test_names = get_failing(testmon_data.all_tests)
-
-        self.deselected_files = [
-            file for file in testmon_data.stable_files if file not in failing_files
-        ]
-        self.deselected_tests = [
-            test_name
-            for test_name in testmon_data.stable_test_names
-            if test_name not in failing_test_names
-        ]
+        # decided by the selection engine (or received from the xdist controller): tests with
+        # a valid passing observation and no valid failing one; files whose every test is so
+        self.deselected_files = set(testmon_data.deselected_files)
+        self.deselected_tests = set(testmon_data.deselected_tests)
+        self.ignored_files = []
         self._interrupted = False
 
     def pytest_ignore_collect(self, collection_path: Path, config):
         strpath = cached_relpath(str(collection_path), str(config.rootpath))
         if strpath in self.deselected_files and self.config.testmon_config.select:
+            self.ignored_files.append(strpath)
+            self.testmon_data.run_info["ignored_files"] = self.ignored_files
             return True
         return None
 
@@ -551,20 +758,30 @@ class TestmonSelect:
             else:
                 selected.append(item)
 
-        sort_items_by_duration(selected, self.testmon_data.avg_durations)
+        avg_durations = self.testmon_data.avg_durations
+        sort_items_by_duration(selected, avg_durations)
 
         if self.config.testmon_config.select:
             items[:] = selected
             session.config.hook.pytest_deselected(
                 items=([FakeItemFromTestmon(session.config)] * len(deselected))
             )
+            deselected_names = [item.nodeid for item in deselected]
         else:
-            sort_items_by_duration(deselected, self.testmon_data.avg_durations)
+            sort_items_by_duration(deselected, avg_durations)
             items[:] = selected + deselected
+            deselected_names = []
+        self.testmon_data.run_info["deselected"] = deselected_names
+        workeroutput = getattr(config, "workeroutput", None)
+        if workeroutput is not None:
+            workeroutput["testmon_deselected"] = deselected_names
+            workeroutput["testmon_ignored_files"] = list(self.ignored_files)
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
-        if len(self.deselected_tests) and exitstatus == ExitCode.NO_TESTS_COLLECTED:
+        if exitstatus == ExitCode.NO_TESTS_COLLECTED and (
+            self.deselected_tests or self.ignored_files
+        ):
             session.exitstatus = ExitCode.OK
 
     @pytest.hookimpl(trylast=True)
@@ -572,7 +789,11 @@ class TestmonSelect:
         if self._interrupted:
             return
 
-        if not self.config.option.verbose >= 2:
+        verbose = self.config.option.verbose
+        if verbose >= 1 and self.testmon_data.selection is not None:
+            write_reason_summary(self.config, self.testmon_data)
+
+        if not verbose >= 2:
             return
 
         (
@@ -618,6 +839,64 @@ class TestmonSelect:
 
     def pytest_keyboard_interrupt(self, excinfo):  # pylint: disable=unused-argument
         self._interrupted = True
+
+
+def write_reason_summary(config, testmon_data):
+    counts = defaultdict(int)
+    for decision in testmon_data.selection.decisions.values():
+        counts[decision.reason] += 1
+    if not counts:
+        return
+    summary = ", ".join(f"{reason}={count}" for reason, count in sorted(counts.items()))
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"testmon decisions for known tests: {summary}")
+
+
+class TestmonReporter:
+    """Writes the --testmon-report JSON at the end of the session (single/controller)."""
+
+    def __init__(self, config, path):
+        self.config = config
+        self.path = path
+        self.selected = None
+        self.outcomes = {}
+        self.started_at = time.time()
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_collection_modifyitems(self, session, config, items):  # pylint: disable=unused-argument
+        yield
+        self.selected = [item.nodeid for item in items]
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_collection_finished(self, node, ids):  # pylint: disable=unused-argument
+        if self.selected is None:
+            self.selected = list(ids)
+
+    @pytest.hookimpl
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call" or report.outcome != "passed":
+            previous = self.outcomes.get(report.nodeid)
+            if previous in (None, "passed"):
+                self.outcomes[report.nodeid] = report.outcome
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session, exitstatus):
+        testmon_data = getattr(self.config, "testmon_data", None)
+        try:
+            report = tm_report.build_report(
+                self.config,
+                self.selected or [],
+                self.outcomes,
+                exitstatus,
+                self.started_at,
+                run_stats=getattr(testmon_data, "run_stats", None),
+            )
+            tm_report.write_report(self.path, report)
+        except OSError as exc:
+            logger.warning(
+                "testmon: could not write the report to %s: %s", self.path, exc
+            )
 
 
 class FakeItemFromTestmon:  # pylint: disable=too-few-public-methods

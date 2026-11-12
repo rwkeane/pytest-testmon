@@ -133,6 +133,14 @@ class Module:
             fs_fsha or bytes_to_string_and_fsha(bytes(source_code, "utf-8"))[1]
         )
         self.ext = ext
+        # fsha of the bytes the source was lazily read from (None: source given directly,
+        # or not read yet). Differs from fs_fsha if the file changed after fs_fsha was taken.
+        self.source_fsha = None
+
+    @property
+    def consistent(self):
+        """True unless the source was read from content other than fs_fsha."""
+        return self.source_fsha is None or self.source_fsha == self.fs_fsha
 
     def dump_and_block(self, node, end, name="unknown", into_block=False):
         """Frame of this method is taken from ast.dump
@@ -214,7 +222,9 @@ class Module:
     @property
     def source_code(self):
         if self._source_code is None:
-            self._source_code = read_source_sha(Path(self.rootdir) / self.filename)[0]
+            self._source_code, self.source_fsha = read_source_sha(
+                Path(self.rootdir) / self.filename
+            )
         return self._source_code
 
     @property

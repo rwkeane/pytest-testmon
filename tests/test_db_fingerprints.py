@@ -1,9 +1,9 @@
-import sqlite3
-
 import pytest
 
 from testmon.db import DB
 from testmon.process_code import Module, create_fingerprint
+from testmon.selection import compute_selection
+from testmon.testmon_core import SourceTree
 
 SOURCE = "def f():\n    return 1\n"
 COMMENTED = "# a comment\ndef f():\n    return 1\n"
@@ -31,20 +31,10 @@ def record(db, exec_id, test_name, source):
     return module.fs_fsha
 
 
-def stored_fsha(datafile, test_name):
-    con = sqlite3.connect(datafile)
-    try:
-        return con.execute(
-            """
-            SELECT f.fsha FROM test_execution te
-            JOIN test_execution_file_fp te_ffp ON te_ffp.test_execution_id = te.id
-            JOIN file_fp f ON f.id = te_ffp.fingerprint_id
-            WHERE te.test_name = ?
-            """,
-            (test_name,),
-        ).fetchone()[0]
-    finally:
-        con.close()
+def memoised(db, fsha):
+    return db.con.execute(
+        "SELECT valid FROM fp_match WHERE fsha = ?", (fsha,)
+    ).fetchall()
 
 
 class TestFingerprintAfterBytesOnlyChange:
@@ -62,6 +52,11 @@ class TestFingerprintAfterBytesOnlyChange:
 
         new_fsha = record(db, exec_id, "test_a.py::test_a", new_source)
 
-        assert stored_fsha(datafile, "test_a.py::test_a") == new_fsha
-        assert db.fetch_unknown_files({"a.py": new_fsha}, exec_id) == []
+        # the current content is known to match: no reanalysis is needed for it
+        assert [row[0] for row in memoised(db, new_fsha)] == [1]
+        tree = SourceTree("")
+        tree.cache["a.py"] = Module(source_code=new_source, fs_fsha=new_fsha)
+        result = compute_selection(db, exec_id, tree, use_snapshots=False)
+        assert result.deselectable == {"test_a.py::test_a", "test_b.py::test_b"}
+        assert result.new_memo == []
         db.con.close()
