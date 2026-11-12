@@ -20,6 +20,7 @@ from coverage.exceptions import CoverageException
 
 from testmon import db
 from testmon import selection
+from testmon.dynamo import DynamoTracker, DynamoUnsupported
 from testmon import TESTMON_VERSION as TM_CLIENT_VERSION
 from testmon.common import (
     get_logger,
@@ -693,6 +694,9 @@ class TestmonCollector:
         self.check_stack = []
         self.is_started = False
         self._interrupted_at = None
+        # code compiled by torch.compile never executes as Python lines: see testmon/dynamo.py
+        self.dynamo = DynamoTracker()
+        self._dynamo_lines = {}  # test name -> {filename: lines traced by dynamo}
 
     def start_cov(self):
         if not self.cov._started:
@@ -761,7 +765,9 @@ class TestmonCollector:
         self.batched_test_names.add(test_name)
         if self.cov is None:
             self.setup_coverage()
+            self._dynamo_call(self.dynamo.start)
 
+        self._dynamo_call(self.dynamo.begin_test)
         self.start_cov()
         self._test_name = test_name
         self.cov.switch_context(test_name)
@@ -770,7 +776,25 @@ class TestmonCollector:
     def discard_current(self):
         self._interrupted_at = self._test_name
 
+    def _dynamo_call(self, function):
+        try:
+            return function()
+        except DynamoUnsupported as exc:
+            pytest.exit(f"testmon: {exc}", returncode=3)
+        return None
+
+    def _harvest_dynamo(self):
+        """Attribute what dynamo traced during the current test (coverage can't see it)."""
+        traced = self._dynamo_call(self.dynamo.harvest)
+        if not traced or not self._test_name or self.cov is None:
+            return
+        files = self._dynamo_lines.setdefault(self._test_name, {})
+        for filename, lines in traced.items():
+            if should_include(self.cov, filename):
+                files.setdefault(filename, set()).update(lines)
+
     def get_batch_coverage_data(self):
+        self._harvest_dynamo()
         if self.check_stack != TestmonCollector.coverage_stack:
             pytest.exit(
                 (
@@ -827,6 +851,13 @@ class TestmonCollector:
                         relfilename, set()
                     ).add(lineno)
                     files_lines.setdefault(file, set()).add(lineno)
+        dynamo_lines, self._dynamo_lines = self._dynamo_lines, {}
+        for context, traced in dynamo_lines.items():
+            for file, lines in traced.items():
+                relfilename = cached_dep_name(file, self.real_rootdir)
+                nodes_files_lines.setdefault(context, {}).setdefault(
+                    relfilename, set()
+                ).update(lines)
         nodes_files_lines.pop(dont_include, None)
         self.batched_test_names.discard(dont_include)
         nodes_files_lines.pop("", None)
@@ -836,6 +867,7 @@ class TestmonCollector:
         return nodes_files_lines, files_lines
 
     def close(self):
+        self.dynamo.stop()
         if self.cov is None:
             return
         assert self.cov in TestmonCollector.coverage_stack

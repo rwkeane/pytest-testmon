@@ -109,6 +109,32 @@ Otherwise the file is collected and individual tests are deselected.
 xdist workers get the controller's selection (they open no database), so all workers collect
 the same tests even while other agents write.
 
+## torch.compile
+
+Testmon learns a test's dependencies by watching which lines run (coverage). Code compiled
+by `torch.compile` never runs line by line: dynamo reads the function and then runs the
+compiled result, so coverage alone would not see the function's body at all, and an edit
+inside it would not rerun its tests. This fork closes that gap. While recording, it collects
+every function dynamo traced for each test (the compiled function, everything inlined into
+it, including other modules, and the code after graph breaks) and records them as
+dependencies, the same as lines that ran normally. An edit inside a compiled function then
+reruns exactly the tests whose compilations used it.
+
+Two consequences:
+
+* **Dynamo's caches are reset before each test while dependencies are recorded**
+  (`torch._dynamo.reset()`). Otherwise a test that reused a function compiled by an earlier
+  test would compile nothing and record nothing. Every test therefore compiles what it uses,
+  which is what EquiCloud's conftest already does. Selection-only runs
+  (`--testmon-nocollect`) don't reset.
+* **An unsupported torch is an error.** If `torch._guards.TracingContext` doesn't provide
+  `traced_code` (a future torch might change this internal), pytest stops (exit code 3)
+  with `cannot record what torch.compile traced`, rather than recording incomplete
+  dependencies.
+
+Out of scope: TorchScript (`torch.jit.script`), `torch.export`, and generated or native
+kernels (Triton, CUDA, C++).
+
 ## Modes (unchanged flags)
 
 | Goal | Command |

@@ -158,6 +158,9 @@ class TestHistoryRewrites:
     def test_cherry_pick(self, repo, shared_db):
         sha = self.feature_branch(repo, shared_db)
         repo.checkout("main")
+        # an unrelated commit on main: the pick gets a new parent, hence always a new SHA
+        repo.write({"NOTES.txt": "main moved on\n"})
+        repo.commit("main: notes")
         repo.git("cherry-pick", sha)
         assert repo.head() != sha
         assert_ran(run_pytest(repo.path, shared_db), set())
