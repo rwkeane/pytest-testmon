@@ -568,11 +568,16 @@ class DB:  # pylint: disable=too-many-public-methods
         except sqlite3.Error as exc:
             raise DbError.from_sqlite(exc) from exc
         finally:
+            # never let the cleanup replace the real error (sqlite may already have rolled
+            # back, e.g. after detecting corruption)
             if self.con is not None and self.con.in_transaction:
                 try:
                     self.con.execute("COMMIT")
                 except sqlite3.Error:
-                    self.con.execute("ROLLBACK")
+                    try:
+                        self.con.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
 
     def _read(self, sql, params=()):
         try:
