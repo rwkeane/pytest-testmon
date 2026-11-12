@@ -578,7 +578,19 @@ class TestmonDeselect(object):
         )
         local_remote.runpytest_inprocess("--testmon", "-v")
         testmon_data = local_remote.td
-        assert "test_a.py::test_add" in testmon_data.all_tests
+        # fork: a skip says nothing about dependencies, so it is not recorded (recording it
+        # as a pass would deselect the test once it is enabled, without it ever running)
+        assert "test_a.py::test_add" not in testmon_data.all_tests
+        local_remote.makepyfile(
+            test_a="""
+            import pytest
+            def test_add():
+                pass
+        """,
+        )
+        result = local_remote.runpytest_inprocess("--testmon", "-v")
+        result.assert_outcomes(passed=1)
+        assert "test_a.py::test_add" in local_remote.td.all_tests
 
     def test_skipped_starting_line2(self, local_remote):
         local_remote.makepyfile(
@@ -591,7 +603,10 @@ class TestmonDeselect(object):
         """,
         )
         local_remote.runpytest_inprocess("--testmon", "-v")
-        assert "test_a.py::test_add" in local_remote.td.all_tests
+        # fork: skipped tests are not recorded (see test_skipped)
+        assert "test_a.py::test_add" not in local_remote.td.all_tests
+        result = local_remote.runpytest_inprocess("--testmon", "-v")
+        result.assert_outcomes(skipped=1)  # still runs (and skips) every time
 
     @pytest.mark.xfail(
         strict=True,
@@ -654,7 +669,13 @@ class TestmonDeselect(object):
             "-v",
         )
 
-        assert assert_test_failed("test_a.py::test_add", local_remote.td) == False
+        # fork: the skip is neither stored as a failure nor as a pass; only the earlier
+        # failing record exists, and it no longer matches the changed file
+        observations = local_remote.td.db.observations_of("test_a.py::test_add")
+        assert [row["failed"] for row in observations] == [1]
+        local_remote.td.determine_stable()
+        decision = local_remote.td.selection.decisions["test_a.py::test_add"]
+        assert not decision.deselect and decision.reason == "all_invalid"
 
         tf = local_remote.makepyfile(
             test_a="""

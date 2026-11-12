@@ -459,6 +459,11 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes,too-many-publ
         """
         test_executions_fingerprints = {}
         for context in nodes_files_lines:
+            if was_skipped(reports[context]):
+                # a skip (marker, skipif, pytest.skip(), a conftest flag turning the test
+                # off) says nothing about what the test depends on; recording it as a pass
+                # would later deselect the test when it is enabled and never ran
+                continue
             deps = []
             complete = True
             for filename, covered in nodes_files_lines[context].items():
@@ -887,6 +892,13 @@ def eval_environment(environment, **kwargs):
         return str(eval(environment, eval_globals))
     except Exception as error:  # pylint: disable=broad-except
         return repr(error)
+
+
+def was_skipped(result):
+    """Skipped in any phase (an expected failure, xfail, did run: it is recorded)."""
+    return any(
+        report.skipped and not hasattr(report, "wasxfail") for report in result.values()
+    )
 
 
 def process_result(result):

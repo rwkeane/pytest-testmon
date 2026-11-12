@@ -69,11 +69,8 @@ def _get_noselect_reasons(options):
     if options["testmon_noselect"]:
         return [None]
 
-    if options["keyword"]:
-        return ["-k was used"]
-
-    if options["markexpr"]:
-        return ["-m was used"]
+    # -k and -m (like any conftest filter) only narrow the collected items; selection then
+    # picks, among those, the tests that need to run: the intersection.
 
     # `--lf` is registered by the cacheprovider plugin, absent with `-p no:cacheprovider`
     if options.get("lf"):

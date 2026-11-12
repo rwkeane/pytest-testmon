@@ -70,15 +70,21 @@ class TestConfigure:
         )
 
     def test_nocollect_minus_k(self, options):
+        # fork: -k/-m narrow the collected tests and selection picks among them (the
+        # intersection) instead of being switched off
         options["keyword"] = "test1"
         options["testmon_nocollect"] = True
         assert configure._header_collect_select(options) == TmConf(
-            (
-                "testmon: collection deactivated, "
-                "selection automatically deactivated because -k was used, "
-            ),
+            "testmon: collection deactivated, ",
             False,
-            False,
+            True,
+        )
+
+    def test_minus_m_keeps_selection(self, options):
+        options["testmon"] = True
+        options["markexpr"] = "gpu"
+        assert configure._header_collect_select(options) == TmConf(
+            "testmon: ", True, True
         )
 
     def test_nocollect_coverage_without_cov_plugin(self, options):

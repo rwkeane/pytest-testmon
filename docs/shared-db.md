@@ -119,7 +119,15 @@ the same tests even while other agents write.
 | Select, don't record | `pytest --testmon --testmon-nocollect` |
 | Separate configuration (e.g. GPU, settings) | `--testmon-env=NAME` |
 
-`-k`, `-m`, `--lf` and explicit `file::test` arguments disable deselection, as upstream does.
+**Filters intersect.** `-k`, `-m` and conftest flags that skip or deselect tests (`--gpu`,
+`--slow`, ...) only narrow the collected tests, and testmon then runs those among them that
+need running. Records are shared between filters: a test that ran under `--gpu` is
+deselected under `--gpu --slow` if its code hasn't changed. Skipped tests are never
+recorded (a skip says nothing about dependencies), so a test that was skipped because its
+flag was off runs the first time the flag is given. This differs from upstream, where `-k`/`-m`
+switched selection off. Explicit `file::test` arguments and `--lf` still run what you named.
+Flags that change *how* tests behave (a backend, a device, settings) need their own
+`--testmon-env=NAME` instead.
 
 ## When the database can't be used
 

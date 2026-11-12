@@ -473,3 +473,137 @@ class TestModes:
         run = run_pytest(repo.path, shared_db, "-n", "2")
         assert_ran(run, ADD)
         assert run.deselected == MUL | SHOUT
+
+
+FLAG_CONFTEST = """
+    import pytest
+
+    MODE = {mode!r}
+
+
+    @pytest.fixture
+    def base():
+        return 10
+
+
+    def pytest_addoption(parser):
+        parser.addoption("--gpu", action="store_true")
+        parser.addoption("--slow", action="store_true")
+
+
+    def pytest_configure(config):
+        config.addinivalue_line("markers", "gpu: needs --gpu")
+        config.addinivalue_line("markers", "slow: needs --slow")
+
+
+    def pytest_collection_modifyitems(config, items):
+        keep, drop = [], []
+        for item in items:
+            needed = [name for name in ("gpu", "slow") if name in item.keywords]
+            if all(config.getoption(name) for name in needed):
+                keep.append(item)
+            elif MODE == "skip":
+                item.add_marker(pytest.mark.skip(reason="flag not given"))
+                keep.append(item)
+            else:
+                drop.append(item)
+        if drop:
+            config.hook.pytest_deselected(items=drop)
+            items[:] = keep
+    """
+
+FLAG_TESTS = {
+    "pkg/hw.py": """
+        def gpu_value():
+            return 1
+
+
+        def slow_value():
+            return 2
+        """,
+    "tests/test_flags.py": """
+        import pytest
+
+        from pkg.hw import gpu_value, slow_value
+
+
+        def test_cpu():
+            pass
+
+
+        @pytest.mark.gpu
+        def test_gpu():
+            assert gpu_value() == 1
+
+
+        @pytest.mark.slow
+        def test_slow():
+            assert slow_value() == 2
+
+
+        @pytest.mark.gpu
+        @pytest.mark.slow
+        def test_gpu_slow():
+            assert gpu_value() + slow_value() == 3
+        """,
+}
+CPU, GPU, SLOW, BOTH = (
+    "tests/test_flags.py::test_cpu",
+    "tests/test_flags.py::test_gpu",
+    "tests/test_flags.py::test_slow",
+    "tests/test_flags.py::test_gpu_slow",
+)
+
+
+def passed(run):
+    return {name for name, outcome in run.outcomes().items() if outcome == "passed"}
+
+
+class TestFilterFlags:
+    """Conftest flags (or -m/-k) narrow the tests; testmon picks what needs running among them."""
+
+    @pytest.mark.parametrize("mode", ["skip", "deselect"])
+    def test_intersection_with_conftest_flags(self, repo, shared_db, mode):
+        repo.write({"tests/conftest.py": FLAG_CONFTEST.format(mode=mode), **FLAG_TESTS})
+        everything_else = ALL_SAMPLE_TESTS | {CPU}
+
+        run = run_pytest(repo.path, shared_db)
+        assert run.returncode == 0, run
+        assert (
+            passed(run) == everything_else
+        )  # flagged tests off (skipped or deselected)
+
+        run = run_pytest(repo.path, shared_db, "--gpu")
+        assert passed(run) == {GPU}, run  # the gpu test was never recorded: it runs now
+        run = run_pytest(repo.path, shared_db, "--gpu", "--slow")
+        assert passed(run) == {SLOW, BOTH}, run  # the gpu-only one is already known
+        run = run_pytest(repo.path, shared_db, "--gpu", "--slow")
+        assert passed(run) == set(), run
+        assert run.returncode == 0
+
+        # a change used by the gpu tests: only the flags that allow them run them
+        repo.write(
+            {"pkg/hw.py": FLAG_TESTS["pkg/hw.py"].replace("return 1", "return 0 + 1")}
+        )
+        assert passed(run_pytest(repo.path, shared_db, "--slow")) == set()
+        assert passed(run_pytest(repo.path, shared_db, "--gpu")) == {GPU}
+        assert passed(run_pytest(repo.path, shared_db, "--gpu", "--slow")) == {BOTH}
+        assert passed(run_pytest(repo.path, shared_db, "--gpu", "--slow")) == set()
+
+    def test_intersection_with_marker_and_keyword_expressions(self, repo, shared_db):
+        repo.write(
+            {"tests/conftest.py": FLAG_CONFTEST.format(mode="skip"), **FLAG_TESTS}
+        )
+        run_pytest(repo.path, shared_db, "--gpu", "--slow")
+        run = run_pytest(repo.path, shared_db, "--gpu", "--slow", "-m", "gpu")
+        assert passed(run) == set() and run.returncode == 0, run
+        repo.write(
+            {"pkg/hw.py": FLAG_TESTS["pkg/hw.py"].replace("return 2", "return 1 + 1")}
+        )
+        assert passed(
+            run_pytest(repo.path, shared_db, "--gpu", "--slow", "-m", "gpu")
+        ) == {BOTH}
+        assert passed(
+            run_pytest(repo.path, shared_db, "--gpu", "--slow", "-k", "slow")
+        ) == {SLOW}
+        assert passed(run_pytest(repo.path, shared_db, "--gpu", "--slow")) == set()
