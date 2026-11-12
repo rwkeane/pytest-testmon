@@ -9,6 +9,7 @@ from tests.shared.helpers import (
     ALL_SAMPLE_TESTS,
     assert_ran,
     copy_without_git,
+    observation_total,
     run_pytest,
 )
 
@@ -422,13 +423,18 @@ class TestForeignCheckout:
     ):
         other = src_repo.clone(tmp_path / "b")
         # like an editable install of checkout a: its src/ is on the path when running in b
+        foreign = {"PYTHONPATH": str(src_repo.path / "src")}
+        run = run_pytest(other.path, shared_db, env=foreign)
+        assert run.returncode == 4, run  # default: refuse, run nothing
+        assert run.report["fallback"]["reason_code"] == "foreign_checkout"
+        assert "passed" not in run.output and "another checkout" in run.output
         run = run_pytest(
-            other.path, shared_db, env={"PYTHONPATH": str(src_repo.path / "src")}
+            other.path, shared_db, "--testmon-db-fallback=run-all", env=foreign
         )
         assert run.report["fallback"]["reason_code"] == "foreign_checkout"
         assert_ran(run, ALL_SAMPLE_TESTS)
         assert {run.reason(name) for name in ALL_SAMPLE_TESTS} == {"fallback"}
-        assert not shared_db.exists()  # nothing recorded
+        assert observation_total(shared_db) == 0  # nothing recorded
         # its own src first (the fix): normal operation
         run = run_pytest(
             other.path, shared_db, env={"PYTHONPATH": str(other.path / "src")}
@@ -442,7 +448,7 @@ class TestModes:
         # full suite without instrumentation
         plain = run_pytest(repo.path, shared_db, testmon=False)
         assert plain.returncode == 0 and "4 passed" in plain.output
-        assert not shared_db.exists()
+        assert observation_total(shared_db) == 0
         # full suite with collection
         run = run_pytest(repo.path, shared_db, "--testmon-noselect")
         assert_ran(run, ALL_SAMPLE_TESTS)

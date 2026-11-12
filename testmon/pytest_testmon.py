@@ -151,8 +151,8 @@ def pytest_addoption(parser):
         default=None,
         choices=FALLBACK_POLICIES,
         help=(
-            "When the database can't be used: run-all (run every test, collect nothing; "
-            "the default) or error (exit before running tests)."
+            "When the database can't be used: error (exit before running any test; the "
+            "default) or run-all (run every test, collect nothing)."
         ),
     )
     group.addoption(
@@ -338,13 +338,13 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
 
 def fallback_message(error):
     return (
-        f"testmon: database unavailable ({error.reason_code}: {error.detail}) "
-        "- running all tests, not collecting"
+        f"testmon: unusable ({error.reason_code}: {error.detail}) "
+        "- running all tests, not collecting (testmon_db_fallback = run-all)"
     )
 
 
 def handle_db_failure(config, error: db.DbError):
-    """Apply the fallback policy: never let a database problem skip a test."""
+    """Apply the fallback policy: never let a database problem skip a test silently."""
     testmon_data = getattr(config, "testmon_data", None)
     if testmon_data is not None:
         testmon_data.close_connection()
@@ -362,13 +362,33 @@ def handle_db_failure(config, error: db.DbError):
         "policy": policy,
     }
     if policy == FALLBACK_ERROR:
+        write_early_report(config)
         pytest.exit(
-            f"testmon: database unavailable ({error.reason_code}: {error.detail}); "
-            "not running tests (testmon_db_fallback = error)",
+            f"testmon: database unavailable ({error.reason_code}: {error.detail}). "
+            "No tests were run. Fix the database, or run without --testmon "
+            "(testmon_db_fallback = run-all runs everything instead).",
             returncode=ExitCode.USAGE_ERROR,
         )
     config.testmon_config = TmConf(fallback_message(error), False, False)
     logger.warning(fallback_message(error))
+
+
+def write_early_report(config):
+    """The report of a session stopped in pytest_configure (nothing ran)."""
+    reporter = config.pluginmanager.get_plugin("TestmonReporter")
+    if reporter is None:
+        return
+    try:
+        tm_report.write_report(
+            reporter.path,
+            tm_report.build_report(
+                config, [], {}, ExitCode.USAGE_ERROR, reporter.started_at
+            ),
+        )
+    except OSError as exc:
+        logger.warning(
+            "testmon: could not write the report to %s: %s", reporter.path, exc
+        )
 
 
 def pytest_configure(config):
@@ -398,8 +418,10 @@ def pytest_configure(config):
     tm_conf = configure.header_collect_select(
         config, coverage_stack, cov_plugin=cov_plugin
     )
-    config.testmon_config: TmConf = tm_conf
     running_as = get_running_as(config)
+    if running_as == "worker" and config.workerinput.get("testmon_disabled"):
+        tm_conf = TmConf(tm_conf.message, False, False)
+    config.testmon_config: TmConf = tm_conf
     report_path = config.getoption("testmon_report") or os.environ.get(REPORT_ENV)
     if report_path and running_as != "worker" and tm_conf.message is not None:
         config.pluginmanager.register(
@@ -414,17 +436,14 @@ def pytest_configure(config):
             foreign = find_foreign_checkout_imports(str(config.rootpath))
             if foreign:
                 names = ", ".join(f"{name} -> {origin}" for name, origin in foreign)
-                message = (
-                    "testmon: deactivated because packages of this checkout are imported "
-                    f"from another checkout ({names}) - running all tests, not collecting"
+                handle_db_failure(
+                    config,
+                    db.DbError(
+                        "foreign_checkout",
+                        "packages of this checkout are imported from another checkout "
+                        f"({names}); dependency data would describe the wrong code",
+                    ),
                 )
-                logger.warning(message)
-                config.testmon_config = TmConf(message, False, False)
-                config.testmon_fallback = {
-                    "reason_code": "foreign_checkout",
-                    "detail": names,
-                    "policy": "run-all",
-                }
                 return
         try:
             init_testmon_data(config)
@@ -658,29 +677,6 @@ class TestmonXdistSync:
         self.sync = sync
         self._collected_recorded = False
 
-    def pytest_configure_node(self, node):
-        """
-        Send the controller's selection to the worker during xdist initialization.
-
-        Every worker must collect exactly the same tests; letting each worker query a shared
-        database that other agents keep writing to could make them disagree. The worker
-        then needs no database connection at all.
-
-        Note: This hook is called on the controller side for each worker node.
-        The node.config here is the controller's config, not the worker's config.
-        """
-        running_as = get_running_as(node.config)
-        if running_as != "controller":
-            return  # Safety check: only run on controller
-
-        testmon_data = getattr(node.config, "testmon_data", None)
-        if testmon_data is not None and hasattr(node, "workerinput"):
-            node.workerinput["testmon_exec_id"] = testmon_data.exec_id
-            node.workerinput["testmon_system_packages_change"] = (
-                testmon_data.system_packages_change
-            )
-            node.workerinput["testmon_selection"] = testmon_data.selection_payload()
-
     @pytest.hookimpl(optionalhook=True)
     def pytest_testnodedown(self, node, error):  # pylint: disable=unused-argument
         testmon_data = getattr(node.config, "testmon_data", None)
@@ -696,6 +692,37 @@ class TestmonXdistSync:
         collected = workeroutput.get("testmon_collected")
         if self.sync and collected:
             testmon_data.record_collection(collected, context_files(node.config))
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    """
+    Tell every xdist worker what the controller decided, before the worker configures.
+
+    Either the controller's selection (every worker must collect exactly the same tests;
+    letting each worker query a shared database that other agents keep writing to could
+    make them disagree, and the worker then needs no database connection at all) or that
+    testmon is off on the controller (not requested, database unusable, foreign checkout),
+    in which case the workers must not use it either.
+
+    Note: called on the controller for each worker node; node.config is the controller's.
+    """
+    if get_running_as(node.config) != "controller" or not hasattr(node, "workerinput"):
+        return
+    testmon_data = getattr(node.config, "testmon_data", None)
+    tm_conf = getattr(node.config, "testmon_config", None)
+    if (
+        testmon_data is not None
+        and tm_conf is not None
+        and (tm_conf.select or tm_conf.collect)
+    ):
+        node.workerinput["testmon_exec_id"] = testmon_data.exec_id
+        node.workerinput["testmon_system_packages_change"] = (
+            testmon_data.system_packages_change
+        )
+        node.workerinput["testmon_selection"] = testmon_data.selection_payload()
+    else:
+        node.workerinput["testmon_disabled"] = True
 
 
 def did_fail(reports):
@@ -779,8 +806,9 @@ class TestmonSelect:
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
+        run_info = self.testmon_data.run_info
         if exitstatus == ExitCode.NO_TESTS_COLLECTED and (
-            self.deselected_tests or self.ignored_files
+            run_info.get("deselected") or run_info.get("ignored_files")
         ):
             session.exitstatus = ExitCode.OK
 

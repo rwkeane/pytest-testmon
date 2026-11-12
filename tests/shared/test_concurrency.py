@@ -111,7 +111,7 @@ def recorded(tmp_path, shared_db):
 def test_lock_at_selection_runs_everything(recorded, shared_db, tmp_path):
     recorded.write(MUL_CHANGED)
     with LockHolder(shared_db, tmp_path, "exclusive"):
-        run = run_pytest(recorded.path, shared_db)
+        run = run_pytest(recorded.path, shared_db, "--testmon-db-fallback=run-all")
     assert run.report["fallback"]["reason_code"] == "lock_timeout", run
     assert_ran(run, EVERY_TEST)
     assert {run.reason(name) for name in EVERY_TEST} == {"fallback"}
@@ -119,8 +119,9 @@ def test_lock_at_selection_runs_everything(recorded, shared_db, tmp_path):
 
 def test_lock_at_selection_with_error_policy(recorded, shared_db, tmp_path):
     with LockHolder(shared_db, tmp_path, "exclusive"):
-        run = run_pytest(recorded.path, shared_db, "--testmon-db-fallback=error")
+        run = run_pytest(recorded.path, shared_db)  # error is the default
     assert run.returncode == 4, run
+    assert run.report["fallback"]["reason_code"] == "lock_timeout"
     assert "passed" not in run.output
     assert "lock_timeout" in run.output
 

@@ -30,7 +30,7 @@ FALLBACK_POLICIES = (FALLBACK_RUN_ALL, FALLBACK_ERROR)
 INI_OPTIONS = {
     "testmon_shared_db": ("path of the shared testmon database", None, ""),
     "testmon_db_fallback": (
-        "what to do when the database is unusable: run-all (default) or error",
+        "what to do when the database is unusable: error (default) or run-all",
         None,
         "",
     ),
@@ -110,7 +110,8 @@ def resolve_db_location(rootdir, cli_value=None, ini_value=None, environ=None):
 
 
 def resolve_fallback(cli_value=None, ini_value=None):
-    value = (cli_value or ini_value or FALLBACK_RUN_ALL).strip()
+    """error (default): stop before running tests; run-all: an explicit opt-in."""
+    value = (cli_value or ini_value or FALLBACK_ERROR).strip()
     if value not in FALLBACK_POLICIES:
         raise ValueError(
             f"testmon_db_fallback must be one of {', '.join(FALLBACK_POLICIES)}, not {value!r}"

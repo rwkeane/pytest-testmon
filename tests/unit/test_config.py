@@ -52,6 +52,7 @@ class TestDbLocation:
         assert (location.source, location.shared) == ("env:TESTMON_DATAFILE", False)
         assert location.path == os.path.join(self.ROOT, "local.db")
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="expanduser uses USERPROFILE")
     def test_expansion(self, monkeypatch):
         monkeypatch.setenv("HOME", "/home/someone")
         monkeypatch.setenv("CACHE", "/var/cache")
@@ -66,7 +67,7 @@ class TestDbLocation:
         )
 
     def test_fallback_policy(self):
-        assert resolve_fallback() == FALLBACK_RUN_ALL
+        assert resolve_fallback() == FALLBACK_ERROR  # default: stop, never run silently
         assert resolve_fallback(None, "error") == FALLBACK_ERROR
         assert resolve_fallback("run-all", "error") == FALLBACK_RUN_ALL
         with pytest.raises(ValueError):
@@ -201,13 +202,35 @@ class TestReport:
         assert report["ignored_files"] == ["test_b.py"]
         assert report["reasons"] == {"all_invalid": 1, "deselect": 2}
 
-    def test_fallback_report(self, pytester):
+    def test_error_report(self, pytester):
         pytester.makepyfile(test_a="def test_1():\n    pass\n")
         bad = pytester.path / "bad.sqlite"
         bad.write_bytes(b"this is not a database" * 100)
         os.chmod(bad, 0o600)
         result = pytester.runpytest_inprocess(
             "--testmon", f"--testmon-shared-db={bad}", "--testmon-report=r.json"
+        )
+        assert result.ret == 4
+        assert "passed" not in result.stdout.str()  # stopped before running anything
+        report = load_report(str(pytester.path / "r.json"))
+        jsonschema.validate(report, SCHEMA)
+        assert report["fallback"] == {
+            "reason_code": "corrupt",
+            "detail": report["fallback"]["detail"],
+            "policy": "error",
+        }
+        assert report["tests"] == {} and report["exitstatus"] == 4
+
+    def test_fallback_report(self, pytester):
+        pytester.makepyfile(test_a="def test_1():\n    pass\n")
+        bad = pytester.path / "bad.sqlite"
+        bad.write_bytes(b"this is not a database" * 100)
+        os.chmod(bad, 0o600)
+        result = pytester.runpytest_inprocess(
+            "--testmon",
+            f"--testmon-shared-db={bad}",
+            "--testmon-report=r.json",
+            "--testmon-db-fallback=run-all",
         )
         result.assert_outcomes(passed=1)
         report = load_report(str(pytester.path / "r.json"))

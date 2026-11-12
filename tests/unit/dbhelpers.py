@@ -50,6 +50,6 @@ def tree(files):
 
 
 def new_db(path, shared=False):
-    database = dbmod.DB(str(path), shared=shared)
+    database = dbmod.DB(str(path), shared=shared, create=shared)
     env_id, _ = database.fetch_or_create_environment("default", "pkgs", "3.12")
     return database, env_id

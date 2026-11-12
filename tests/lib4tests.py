@@ -143,6 +143,7 @@ def make_shared_flavor(testdir):
     from testmon.db import DB  # pylint: disable=import-outside-toplevel
 
     path = shared_db_path(testdir)
+    DB(path, shared=True, create=True).close()  # as `testmon-admin init` does
     return make_flavor(
         testdir,
         "shared",

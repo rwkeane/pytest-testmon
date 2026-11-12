@@ -271,9 +271,22 @@ class TestConnection:
 @posix_only
 @not_root
 class TestPermissions:
+    def test_missing_shared_database_is_an_error(self, tmp_path):
+        path = tmp_path / "nope" / "db.sqlite"
+        with pytest.raises(DbError) as excinfo:
+            DB(str(path), shared=True)
+        assert excinfo.value.reason_code == "missing"
+        assert "testmon-admin" in excinfo.value.detail
+        assert not path.parent.exists()  # nothing created as a side effect
+        path.parent.mkdir()
+        path.touch()  # an empty file is not a database either
+        with pytest.raises(DbError) as excinfo:
+            DB(str(path), shared=True)
+        assert excinfo.value.reason_code == "missing"
+
     def test_creates_private_directory_and_file(self, tmp_path):
         path = tmp_path / "new" / "dir" / "db.sqlite"
-        with DB(str(path), shared=True):
+        with DB(str(path), shared=True, create=True):
             pass
         assert oct(os.stat(path.parent).st_mode & 0o777) == "0o700"
         assert oct(os.stat(path).st_mode & 0o777) == "0o600"
@@ -283,7 +296,7 @@ class TestPermissions:
         directory.mkdir()
         os.chmod(directory, 0o770)
         with pytest.raises(DbError) as excinfo:
-            DB(str(directory / "db.sqlite"), shared=True)
+            DB(str(directory / "db.sqlite"), shared=True, create=True)
         assert excinfo.value.reason_code == "permission"
         assert not (directory / "db.sqlite").exists()
 
@@ -291,33 +304,33 @@ class TestPermissions:
         directory = tmp_path / "shared"
         directory.mkdir(mode=0o700)
         path = directory / "db.sqlite"
-        with DB(str(path), shared=True):
+        with DB(str(path), shared=True, create=True):
             pass
         os.chmod(path, 0o606)
         with pytest.raises(DbError) as excinfo:
-            DB(str(path), shared=True)
+            DB(str(path), shared=True, create=True)
         assert excinfo.value.reason_code == "permission"
 
     def test_readable_file_is_tightened(self, tmp_path):
         directory = tmp_path / "shared"
         directory.mkdir(mode=0o700)
         path = directory / "db.sqlite"
-        with DB(str(path), shared=True):
+        with DB(str(path), shared=True, create=True):
             pass
         os.chmod(path, 0o644)
-        with DB(str(path), shared=True):
+        with DB(str(path), shared=True, create=True):
             pass
         assert oct(os.stat(path).st_mode & 0o777) == "0o600"
 
     def test_symlink_to_own_file_allowed(self, tmp_path):
         real_dir = tmp_path / "real"
         real_dir.mkdir(mode=0o700)
-        with DB(str(real_dir / "db.sqlite"), shared=True):
+        with DB(str(real_dir / "db.sqlite"), shared=True, create=True):
             pass
         link_dir = tmp_path / "link"
         link_dir.mkdir(mode=0o700)
         os.symlink(real_dir / "db.sqlite", link_dir / "db.sqlite")
-        with DB(str(link_dir / "db.sqlite"), shared=True) as database:
+        with DB(str(link_dir / "db.sqlite"), shared=True, create=True) as database:
             assert database.con.execute("PRAGMA application_id").fetchone()[0]
 
     def test_private_database_is_not_checked(self, tmp_path):
@@ -345,7 +358,7 @@ class TestSchema:
         upstream_v15(str(path))
         before = path.read_bytes()
         with pytest.raises(DbError) as excinfo:
-            DB(str(path), shared=True)
+            DB(str(path), shared=True, create=True)
         assert excinfo.value.reason_code == "foreign_db"
         assert path.read_bytes() == before
 
@@ -361,20 +374,20 @@ class TestSchema:
 
     def test_newer_incompatible_schema_is_refused(self, tmp_path):
         path = tmp_path / "s" / "db.sqlite"
-        with DB(str(path), shared=True) as database:
+        with DB(str(path), shared=True, create=True) as database:
             database.con.execute("PRAGMA user_version = 5000")
             database.con.execute(
                 "UPDATE metadata SET value = 5000 WHERE key = 'compat_version'"
             )
         with pytest.raises(DbError) as excinfo:
-            DB(str(path), shared=True)
+            DB(str(path), shared=True, create=True)
         assert excinfo.value.reason_code == "incompatible_schema"
 
     def test_newer_compatible_schema_is_used(self, tmp_path):
         path = tmp_path / "s" / "db.sqlite"
-        with DB(str(path), shared=True) as database:
+        with DB(str(path), shared=True, create=True) as database:
             database.con.execute("PRAGMA user_version = 1001")
-        with DB(str(path), shared=True) as database:
+        with DB(str(path), shared=True, create=True) as database:
             assert database.con.execute("PRAGMA user_version").fetchone()[0] == 1001
 
     def test_additive_migration(self, tmp_path, monkeypatch):
@@ -388,7 +401,7 @@ class TestSchema:
 
         monkeypatch.setattr(dbmod, "MIGRATIONS", {1001: (add_column, 1000)})
         monkeypatch.setattr(dbmod, "DATA_VERSION", 1001)
-        with DB(path, shared=True) as database:
+        with DB(path, shared=True, create=True) as database:
             assert database.con.execute("PRAGMA user_version").fetchone()[0] == 1001
             assert database.con.execute(
                 "SELECT test_name, note FROM observation"
@@ -398,35 +411,35 @@ class TestSchema:
             )
         # an older client (pinned on another branch) keeps working
         monkeypatch.setattr(dbmod, "DATA_VERSION", 1000)
-        with DB(path, shared=True) as database:
+        with DB(path, shared=True, create=True) as database:
             assert database.all_test_executions(env_id)
 
     def test_breaking_migration_locks_out_older_clients(self, tmp_path, monkeypatch):
         path = str(tmp_path / "s" / "db.sqlite")
-        DB(path, shared=True).close()
+        DB(path, shared=True, create=True).close()
         monkeypatch.setattr(dbmod, "MIGRATIONS", {1001: (lambda con: None, 1001)})
         monkeypatch.setattr(dbmod, "DATA_VERSION", 1001)
-        DB(path, shared=True).close()
+        DB(path, shared=True, create=True).close()
         monkeypatch.setattr(dbmod, "DATA_VERSION", 1000)
         with pytest.raises(DbError) as excinfo:
-            DB(path, shared=True)
+            DB(path, shared=True, create=True)
         assert excinfo.value.reason_code == "incompatible_schema"
 
     def test_no_migration_path(self, tmp_path, monkeypatch):
         shared = str(tmp_path / "s" / "db.sqlite")
         private = str(tmp_path / ".testmondata")
-        DB(shared, shared=True).close()
+        DB(shared, shared=True, create=True).close()
         DB(private).close()
         monkeypatch.setattr(dbmod, "DATA_VERSION", 1002)
         with pytest.raises(DbError) as excinfo:
-            DB(shared, shared=True)
+            DB(shared, shared=True, create=True)
         assert excinfo.value.reason_code == "incompatible_schema"
         with DB(private) as database:
             assert database.file_created
 
     def test_concurrent_migration_applies_once(self, tmp_path):
         path = str(tmp_path / "s" / "db.sqlite")
-        DB(path, shared=True).close()
+        DB(path, shared=True, create=True).close()
         script = tmp_path / "migrate.py"
         script.write_text(
             textwrap.dedent(
@@ -438,7 +451,7 @@ class TestSchema:
                     con.execute("CREATE TABLE IF NOT EXISTS extra (x)")
                 db.MIGRATIONS = {{1001: (slow, 1000)}}
                 db.DATA_VERSION = 1001
-                with db.DB({path!r}, shared=True) as database:
+                with db.DB({path!r}, shared=True) as database:  # exists
                     assert database.con.execute("PRAGMA user_version").fetchone()[0] == 1001
                 """
             )

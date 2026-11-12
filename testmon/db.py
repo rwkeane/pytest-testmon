@@ -79,7 +79,8 @@ class TestmonDbException(Exception):
 class DbError(TestmonDbException):
     """A database problem, classified so callers can apply the fallback policy and report it.
 
-    reason_code is one of: open_failed, permission, corrupt, incompatible_schema, foreign_db,
+    reason_code is one of: missing, open_failed, permission, corrupt, incompatible_schema,
+    foreign_db,
     lock_timeout, io, db_error.
     """
 
@@ -144,17 +145,26 @@ def _fault(point):
 # --------------------------------------------------------------------------------------
 
 
-def secure_location(path):
-    """Create/verify a private location for a shared database (owner-only, POSIX).
+def secure_location(path, create=False):
+    """Verify (and with create=True, create) a private location for a shared database.
 
     Refuses (DbError "permission") a directory or file owned by another user, or one that is
-    group/world-writable; tightens group/world-readable files that we own.
+    group/world-writable; tightens group/world-readable files that we own. A database that
+    does not exist is DbError "missing" unless create=True: a shared database is created
+    deliberately (testmon-admin init), never as a side effect of a test run.
     """
+    if not create and not (os.path.exists(path) and os.path.getsize(path) > 0):
+        raise DbError(
+            "missing",
+            f"{path} does not exist; create it once with `testmon-admin --db {path} init`, "
+            "or run pytest without --testmon",
+        )
     if os.name != "posix":
         return
     directory = os.path.dirname(path) or "."
     try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
+        if create:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
     except OSError as exc:
         raise DbError("open_failed", f"cannot create {directory}: {exc}") from exc
     uid = os.getuid()
@@ -316,8 +326,10 @@ class DB:  # pylint: disable=too-many-public-methods
         readonly=False,
         shared=False,
         timeout=DEFAULT_TIMEOUT,
+        create=False,
     ):
         self.datafile = os.fspath(datafile)
+        self._create = create
         self._readonly = readonly
         self.shared = shared
         self.timeout = timeout
@@ -370,8 +382,11 @@ class DB:  # pylint: disable=too-many-public-methods
         con.execute("PRAGMA journal_size_limit = 67108864")
 
     def _open(self):
-        if self.shared and not self._readonly:
-            secure_location(self.datafile)
+        if self.shared:
+            if self._readonly:
+                secure_location(self.datafile, create=False)  # existence only
+            else:
+                secure_location(self.datafile, create=self._create)
         self.con = self._connect()
         self._configure(self.con)
         # inspect before changing anything: a foreign file must be left exactly as it is

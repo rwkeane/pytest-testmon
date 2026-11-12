@@ -5,6 +5,14 @@ only tests affected by recent changes. How is this possible in dynamic
 language like Python and how reliable is it? Read here: [Determining
 affected tests](https://testmon.org/blog/determining-affected-tests/)
 
+## This fork: one shared database for every checkout
+
+This fork stores many versions of each test's dependencies in a single SQLite database that
+every clone, worktree, branch and agent on the machine can share. Records are reused wherever
+they still match the source, regardless of branch, commit or path. See
+[docs/shared-db.md](docs/shared-db.md) for setup (one ini line plus `testmon-admin init`), behaviour, reports and
+maintenance. `--tmnet` is not supported.
+
 ## Quickstart
 
     pip install pytest-testmon

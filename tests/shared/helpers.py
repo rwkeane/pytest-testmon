@@ -274,6 +274,29 @@ def collect(popen, checkout, timeout=300):
     return Run(proc, report)
 
 
+def init_db(path):
+    """testmon-admin init, as a separate process (as a user would run it)."""
+    result = subprocess.run(
+        [PYTHON, "-m", "testmon.admin", "--db", str(path), "init"],
+        capture_output=True,
+        text=True,
+        env=clean_env(),
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return Path(path)
+
+
+def observation_total(shared_db):
+    import sqlite3  # pylint: disable=import-outside-toplevel
+
+    con = sqlite3.connect(str(shared_db))
+    try:
+        return con.execute("SELECT count(*) FROM observation").fetchone()[0]
+    finally:
+        con.close()
+
+
 def copy_without_git(src, dest):
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".git", "report.json"))
     return Path(dest)

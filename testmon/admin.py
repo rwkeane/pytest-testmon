@@ -2,6 +2,7 @@
 
     testmon-admin [--db PATH | --rootdir DIR] [--json] COMMAND
 
+    init                       create the shared database (once per machine)
     stats                      row counts, file sizes, sessions
     check                      PRAGMA integrity_check (exit 1 when not ok)
     gc [--aggressive] [--retention-days N] [--max-versions N]
@@ -53,6 +54,20 @@ def emit(args, data, text=None):
         print(json.dumps(data, indent=1, sort_keys=True, default=str))
     else:
         print(text if text is not None else json.dumps(data, indent=1, default=str))
+
+
+def cmd_init(args):
+    path, shared = resolve(args)
+    existed = os.path.exists(path) and os.path.getsize(path) > 0
+    with dbmod.DB(path, shared=shared, create=True) as database:
+        version = database.con.execute("PRAGMA user_version").fetchone()[0]
+    state = "already existed" if existed else "created"
+    emit(
+        args,
+        {"path": path, "created": not existed, "schema_version": version},
+        f"{path}: {state} (schema {version})",
+    )
+    return 0
 
 
 def cmd_stats(args):
@@ -265,6 +280,7 @@ def build_parser():
     parser.add_argument("--rootdir", default=".", help="project/checkout directory")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("init").set_defaults(func=cmd_init)
     sub.add_parser("stats").set_defaults(func=cmd_stats)
     sub.add_parser("check").set_defaults(func=cmd_check)
     gc_parser = sub.add_parser("gc")

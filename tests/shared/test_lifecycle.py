@@ -61,9 +61,6 @@ COLLECTOR = """
 
 def test_gc_racing_a_writer_loses_nothing_recent(tmp_path, shared_db):
     GitRepo.init(tmp_path / "repo")
-    from testmon.db import DB  # pylint: disable=import-outside-toplevel
-
-    DB(str(shared_db), shared=True).close()
     writer = python(WRITER, shared_db, 8, wait=False)
     collector = python(COLLECTOR, shared_db, 8, wait=False)
     written, werr = writer.communicate(timeout=120)

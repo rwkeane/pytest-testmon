@@ -214,12 +214,12 @@ def test_unusable_database_runs_everything(kind, recorded_small, shared_db):
     corrupt, reasons = CORRUPTIONS[kind]
     corrupt(shared_db)
     before = shared_db.read_bytes() if os.access(shared_db, os.R_OK) else None
-    run = run_pytest(recorded_small.path, shared_db)
+    run = run_pytest(recorded_small.path, shared_db, "--testmon-db-fallback=run-all")
     assert run.report["fallback"] is not None, run
     assert run.report["fallback"]["reason_code"] in reasons, run.report["fallback"]
     assert_ran(run, ALL_SAMPLE_TESTS)
     assert run.outcomes() == {name: "passed" for name in ALL_SAMPLE_TESTS}
-    assert "database unavailable" in run.output
+    assert "testmon: unusable" in run.output
     # the shared file is never deleted, renamed or modified by pytest
     assert shared_db.exists()
     if before is not None:
@@ -230,17 +230,25 @@ def test_unusable_database_runs_everything(kind, recorded_small, shared_db):
 @pytest.mark.parametrize("kind", sorted(CORRUPTIONS))
 def test_unusable_database_with_error_policy(kind, recorded_small, shared_db):
     CORRUPTIONS[kind][0](shared_db)
-    run = run_pytest(recorded_small.path, shared_db, "--testmon-db-fallback=error")
+    before = shared_db.read_bytes() if os.access(shared_db, os.R_OK) else None
+    run = run_pytest(recorded_small.path, shared_db)  # error is the default policy
     assert run.returncode == 4, run
     assert "passed" not in run.output
-    assert "database unavailable" in run.output
+    assert "database unavailable" in run.output and "No tests were run" in run.output
+    assert run.report["fallback"]["policy"] == "error"
+    assert run.report["fallback"]["reason_code"] in CORRUPTIONS[kind][1]
+    assert run.report["tests"] == {}
+    if before is not None:
+        assert shared_db.read_bytes() == before
 
 
 @not_root
 def test_read_only_directory_never_skips_affected_tests(recorded_small, shared_db):
     os.chmod(shared_db.parent, 0o500)
     try:
-        run = run_pytest(recorded_small.path, shared_db)
+        run = run_pytest(
+            recorded_small.path, shared_db, "--testmon-db-fallback=run-all"
+        )
     finally:
         os.chmod(shared_db.parent, 0o700)
     assert run.returncode == 0, run
@@ -250,13 +258,24 @@ def test_read_only_directory_never_skips_affected_tests(recorded_small, shared_d
         assert run.selected == MUL
 
 
-def test_missing_parent_directory_is_created(tmp_path):
-    from tests.shared.helpers import GitRepo  # pylint: disable=import-outside-toplevel
+def test_missing_database_is_an_error_until_initialized(tmp_path):
+    from tests.shared.helpers import GitRepo, init_db  # pylint: disable=import-outside-toplevel
 
     repo = GitRepo.init(tmp_path / "repo")
     shared_db = tmp_path / "does" / "not" / "exist" / "db.sqlite"
-    assert_ran(run_pytest(repo.path, shared_db), ALL_SAMPLE_TESTS)
+    run = run_pytest(repo.path, shared_db)
+    assert run.returncode == 4, run
+    assert "passed" not in run.output
+    assert run.report["fallback"]["reason_code"] == "missing"
+    assert "testmon-admin" in run.output
+    assert not shared_db.parent.exists()  # nothing created as a side effect
+    # the explicit opt-in still runs everything, and still creates nothing
+    run = run_pytest(repo.path, shared_db, "--testmon-db-fallback=run-all")
+    assert_ran(run, ALL_SAMPLE_TESTS)
+    assert not shared_db.exists()
+    init_db(shared_db)
     assert oct(os.stat(shared_db.parent).st_mode & 0o777) == "0o700"
+    assert_ran(run_pytest(repo.path, shared_db), ALL_SAMPLE_TESTS)
     assert_ran(run_pytest(repo.path, shared_db), set())
 
 
@@ -277,3 +296,13 @@ def test_restart_persistence(repo_many, shared_db):
         MANY_TESTS
         <= run_pytest(repo_many.path, shared_db, "--testmon-noselect").selected
     )
+
+
+def test_xdist_workers_follow_the_controller_fallback(recorded_small, shared_db):
+    pytest.importorskip("xdist")
+    garbage_header(shared_db)
+    run = run_pytest(
+        recorded_small.path, shared_db, "-n", "2", "--testmon-db-fallback=run-all"
+    )
+    assert run.report["fallback"]["reason_code"] == "corrupt", run
+    assert_ran(run, ALL_SAMPLE_TESTS)  # no worker deselected anything on its own
