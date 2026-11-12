@@ -128,6 +128,32 @@ def make_flavor(testdir, name, plugin_factories=(), extra_args=(), open_db=None)
 # "local" always, "xdist" (the same under `-n 2`) when pytest-xdist is installed. Plugins can add
 # more through the `pytest_testmon_flavors` hook declared in tests/conftest.py.
 FLAVORS = {"local": lambda testdir: make_flavor(testdir, "local")}
+
+
+def shared_db_path(testdir):
+    """A shared database outside the test project (as for several checkouts)."""
+    return str(
+        testdir.tmpdir.dirpath().join(
+            f"{testdir.tmpdir.basename}-shared", "testmon.sqlite"
+        )
+    )
+
+
+def make_shared_flavor(testdir):
+    from testmon.db import DB  # pylint: disable=import-outside-toplevel
+
+    path = shared_db_path(testdir)
+    return make_flavor(
+        testdir,
+        "shared",
+        # "=": a separate value would be taken for a path argument when pytest picks the rootdir
+        extra_args=(f"--testmon-shared-db={path}",),
+        open_db=lambda: DB(path, shared=True),
+    )
+
+
+# the same tests against a shared database outside the project directory
+FLAVORS["shared"] = make_shared_flavor
 if importlib.util.find_spec("xdist"):
     FLAVORS["xdist"] = lambda testdir: make_flavor(
         testdir, "xdist", extra_args=("-n", "2")

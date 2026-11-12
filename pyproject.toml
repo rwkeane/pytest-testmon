@@ -38,6 +38,10 @@ Source = "https://github.com/tarpas/pytest-testmon"
 [project.entry-points.pytest11]
 pytest-testmon = "testmon.pytest_testmon"
 
+[project.scripts]
+testmon-admin = "testmon.admin:main"
+testmon-verify = "testmon.verify:main"
+
 [tool.setuptools]
 packages = ["testmon"]
 
@@ -55,4 +59,6 @@ dev = [
     "tox",
     "tox-gh-actions",
     "pre-commit",
+    "hypothesis>=6.170.15",
+    "jsonschema>=4.26.0",
 ]

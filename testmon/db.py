@@ -349,26 +349,32 @@ class DB:  # pylint: disable=too-many-public-methods
         )
 
     def _configure(self, con):
+        """Read-only settings; safe on a file we may still refuse to touch."""
         con.row_factory = sqlite3.Row
         con.execute(f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
         con.execute("PRAGMA foreign_keys = ON")
-        if not self._readonly:
-            if not con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
-                # must precede the first table; ignored afterwards
-                con.execute("PRAGMA auto_vacuum = INCREMENTAL")
-            mode = con.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-            if str(mode).lower() != "wal" and self.shared:
-                raise DbError("db_error", f"could not enable WAL mode (got {mode})")
-            con.execute("PRAGMA synchronous = NORMAL")
-            con.execute("PRAGMA journal_size_limit = 67108864")
         for statement in TEMP_STATEMENTS:
             con.execute(statement)
+
+    def _configure_for_writing(self, con):
+        """Settings that modify the file (journal mode in the header): only on our files."""
+        if self._readonly:
+            return
+        if not con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
+            # must precede the first table; ignored afterwards
+            con.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        mode = con.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        if str(mode).lower() != "wal" and self.shared:
+            raise DbError("db_error", f"could not enable WAL mode (got {mode})")
+        con.execute("PRAGMA synchronous = NORMAL")
+        con.execute("PRAGMA journal_size_limit = 67108864")
 
     def _open(self):
         if self.shared and not self._readonly:
             secure_location(self.datafile)
         self.con = self._connect()
         self._configure(self.con)
+        # inspect before changing anything: a foreign file must be left exactly as it is
         app_id = self.con.execute("PRAGMA application_id").fetchone()[0]
         version = self.con.execute("PRAGMA user_version").fetchone()[0]
         has_tables = self.con.execute(
@@ -377,8 +383,8 @@ class DB:  # pylint: disable=too-many-public-methods
         if not has_tables and app_id == 0 and version == 0:
             if self._readonly:
                 raise DbError("open_failed", f"{self.datafile} is empty")
+            self._configure_for_writing(self.con)
             self.file_created = self._initialize()
-            app_id = APPLICATION_ID
         elif app_id != APPLICATION_ID:
             if self.shared or self._readonly:
                 raise DbError(
@@ -387,12 +393,18 @@ class DB:  # pylint: disable=too-many-public-methods
                     f"(application_id={app_id}, user_version={version}); refusing to modify it",
                 )
             # a private .testmondata in upstream's (or another) format: recreate, like upstream
-            self.con.close()
-            _remove_database_files(self.datafile)
-            self.con = self._connect()
-            self._configure(self.con)
-            self.file_created = self._initialize()
+            self._recreate()
+        else:
+            self._configure_for_writing(self.con)
         self._check_schema()
+
+    def _recreate(self):
+        self.con.close()
+        _remove_database_files(self.datafile)
+        self.con = self._connect()
+        self._configure(self.con)
+        self._configure_for_writing(self.con)
+        self.file_created = self._initialize()
 
     def _initialize(self):
         def body(con):
@@ -443,11 +455,7 @@ class DB:  # pylint: disable=too-many-public-methods
                     "refusing to modify the shared database",
                 )
             # private database without a migration path: recreate it, like upstream
-            self.con.close()
-            _remove_database_files(self.datafile)
-            self.con = self._connect()
-            self._configure(self.con)
-            self.file_created = self._initialize()
+            self._recreate()
             return
         self.migrate()
 

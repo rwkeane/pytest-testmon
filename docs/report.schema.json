@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/testmon-report.schema.json",
+  "title": "testmon run report",
+  "description": "Written by pytest --testmon --testmon-report PATH (or TESTMON_REPORT). Every collected test has a decision and a reason.",
+  "type": "object",
+  "required": [
+    "schema_version", "testmon_version", "rootdir", "exitstatus", "db", "mode",
+    "fallback", "environment", "session_id", "worktree", "verified_tree", "timings",
+    "counts", "reasons", "ignored_files", "tests", "warnings"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "testmon_version": {"type": "string"},
+    "rootdir": {"type": "string"},
+    "exitstatus": {"type": "integer"},
+    "db": {
+      "type": "object",
+      "required": ["path", "shared", "source", "new"],
+      "properties": {
+        "path": {"type": ["string", "null"]},
+        "shared": {"type": "boolean"},
+        "source": {"type": ["string", "null"], "description": "cli | env:TESTMON_SHARED_DB | ini | env:TESTMON_DATAFILE | default"},
+        "new": {"type": "boolean"}
+      }
+    },
+    "mode": {
+      "type": "object",
+      "required": ["select", "collect", "message"],
+      "properties": {
+        "select": {"type": "boolean"},
+        "collect": {"type": "boolean"},
+        "message": {"type": ["string", "null"]}
+      }
+    },
+    "fallback": {
+      "description": "Present when testmon could not use its database (or found a foreign checkout): every test ran, nothing was recorded.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["reason_code", "detail", "policy"],
+          "properties": {
+            "reason_code": {"enum": ["open_failed", "permission", "corrupt", "incompatible_schema", "foreign_db", "lock_timeout", "io", "db_error", "foreign_checkout"]},
+            "detail": {"type": "string"},
+            "policy": {"enum": ["run-all", "error"]}
+          }
+        }
+      ]
+    },
+    "environment": {
+      "type": "object",
+      "required": ["id", "name", "packages_changed"],
+      "properties": {
+        "id": {"type": ["integer", "null"]},
+        "name": {"type": ["string", "null"]},
+        "packages_changed": {"type": "boolean"}
+      }
+    },
+    "session_id": {"type": ["integer", "null"]},
+    "worktree": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["git_head", "dirty", "diff_hash"],
+          "properties": {
+            "git_head": {"type": "string"},
+            "dirty": {"type": "boolean"},
+            "diff_hash": {"type": ["string", "null"]}
+          }
+        }
+      ]
+    },
+    "verified_tree": {"type": ["string", "null"], "description": "git tree tested by testmon-verify --staged/--ref"},
+    "timings": {"type": "object", "additionalProperties": {"type": "number"}},
+    "counts": {
+      "type": "object",
+      "required": ["collected", "selected", "deselected", "file_ignored", "observations_reused", "observations_known", "dropped_batches"],
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "reasons": {"type": "object", "additionalProperties": {"type": "integer"}},
+    "run_stats": {"type": ["object", "null"]},
+    "ignored_files": {"type": "array", "items": {"type": "string"}},
+    "tests": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["decision", "reason", "observation_id", "invalid_dep", "file_ignored"],
+        "properties": {
+          "decision": {"enum": ["selected", "deselected"]},
+          "reason": {"enum": ["deselect", "no_observation", "all_invalid", "valid_failing_observation", "selector_forced", "fallback"]},
+          "observation_id": {"type": ["integer", "null"]},
+          "invalid_dep": {
+            "oneOf": [
+              {"type": "null"},
+              {
+                "type": "object",
+                "required": ["filename", "cause"],
+                "properties": {
+                  "filename": {"type": "string"},
+                  "cause": {"enum": ["missing", "mismatch", "incomplete"]}
+                }
+              }
+            ]
+          },
+          "file_ignored": {"type": "boolean"},
+          "outcome": {"enum": ["passed", "failed", "skipped"]}
+        }
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}
